@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 2: Architecture - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html" class="active">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Chapter 2: Architecture</h1>
+        <p class="subtitle">The Master-Client Model That Makes It All Work</p>
+
+        <div class="analogy-box">
+            <h3>🎪 The Wedding Planner Analogy</h3>
+            <p>Think of PCCL's architecture like a wedding:</p>
+            <ul>
+                <li><strong>Master = Wedding Planner</strong> - Coordinates everything, but doesn't cook the food</li>
+                <li><strong>Peers = Vendors</strong> - Caterer, photographer, DJ - they do the actual work</li>
+                <li><strong>P2P Connections = Vendors talking directly</strong> - "Hey DJ, I'm serving dessert now!"</li>
+            </ul>
+        </div>
+
+        <h2>The Big Picture</h2>
+
+        <div class="diagram">
+                        ┌─────────────────────┐
+                        │       MASTER        │
+                        │  (Wedding Planner)  │
+                        │                     │
+                        │  • Tracks who's in  │
+                        │  • Coordinates ops  │
+                        │  • Optimizes ring   │
+                        │  • NO data transfer │
+                        └──────────┬──────────┘
+                                   │
+              Coordination only    │    (lightweight!)
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         │                         │                         │
+         ▼                         ▼                         ▼
+    ┌─────────┐              ┌─────────┐              ┌─────────┐
+    │ PEER A  │◄────────────►│ PEER B  │◄────────────►│ PEER C  │
+    │ (GPU 0) │   P2P Data   │ (GPU 1) │   P2P Data   │ (GPU 2) │
+    └─────────┘              └─────────┘              └─────────┘
+         ▲                                                  │
+         └──────────────────── P2P Data ────────────────────┘
+         
+    Data flows DIRECTLY between peers - Master never touches it!
+        </div>
+
+        <h2>What the Master Tracks</h2>
+
+        <table>
+            <tr><th>Responsibility</th><th>Details</th></tr>
+            <tr><td>Client Status</td><td>REGISTERED vs ACCEPTED phase</td></tr>
+            <tr><td>Ring Topology</td><td>Optimal peer ordering (via ATSP)</td></tr>
+            <tr><td>Shared State Hashes</td><td>Identifies out-of-sync peers</td></tr>
+            <tr><td>Collective Operations</td><td>Consensus on start/complete/abort</td></tr>
+        </table>
+
+        <h2>The Golden Rule</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ ONE Operation At A Time!</h3>
+            <p>PCCL enforces: only ONE major operation can be active:</p>
+            <ul>
+                <li>Accepting new peers, OR</li>
+                <li>Synchronizing shared state, OR</li>
+                <li>Running a collective (all-reduce)</li>
+            </ul>
+            <p><strong>Why?</strong> This makes fault tolerance TRACTABLE. Previous attempts failed with concurrent operations!</p>
+        </div>
+
+        <h2>SimpleHash: GPU-Parallel Hashing</h2>
+
+        <div class="remember-this">
+            <h3>💡 The Problem</h3>
+            <p>To verify all peers have identical weights, we need to hash gigabytes of data. Standard hashes (SHA-256) are sequential and slow on GPU.</p>
+        </div>
+
+        <h3>SimpleHash Algorithm</h3>
+
+        <p>PCCL uses a custom hash inspired by <strong>FNV-1a</strong> but designed for GPU parallelism:</p>
+
+        <div class="diagram">
+SimpleHash Architecture (Warp-Tree Reduce)
+─────────────────────────────────────────────────────────────────────────
+
+Step 1: Parallel chunk hashing (one thread per element)
+┌────┬────┬────┬────┬────┬────┬────┬────┐
+│ h0 │ h1 │ h2 │ h3 │ h4 │ h5 │ h6 │ h7 │  ← 8 threads, 8 hashes
+└─┬──┴─┬──┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┘
+  │    │     │    │    │    │    │    │
+  └──┬─┘     └──┬─┘    └──┬─┘    └──┬─┘
+     │          │         │         │
+Step 2: Warp-level reduction (XOR + multiply)
+   ┌─┴─┐      ┌─┴─┐     ┌─┴─┐     ┌─┴─┐
+   │h01│      │h23│     │h45│     │h67│    ← 4 partial hashes
+   └─┬─┘      └─┬─┘     └─┬─┘     └─┬─┘
+     │          │         │         │
+     └────┬─────┘         └────┬────┘
+          │                    │
+Step 3: Block-level reduction
+       ┌──┴──┐              ┌──┴──┐
+       │h0123│              │h4567│         ← 2 partial hashes
+       └──┬──┘              └──┬──┘
+          │                    │
+          └─────────┬──────────┘
+                    │
+Step 4: Final hash
+              ┌─────┴─────┐
+              │ FINAL HASH │                ← 64-bit result
+              └───────────┘
+        </div>
+
+        <div class="code-block">
+<pre><code>// SimpleHash core (FNV-1a inspired)
+__device__ uint64_t simple_hash_step(uint64_t hash, uint64_t value) {
+    const uint64_t FNV_PRIME = 0x100000001b3ULL;
+    hash ^= value;
+    hash *= FNV_PRIME;
+    return hash;
+}
+
+// Warp-level reduction using shuffle
+__device__ uint64_t warp_reduce_hash(uint64_t hash) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        uint64_t other = __shfl_down_sync(0xffffffff, hash, offset);
+        hash = simple_hash_step(hash, other);
+    }
+    return hash;
+}</code></pre>
+        </div>
+
+        <div class="trivia">
+            <p><strong>Cross-GPU Determinism:</strong> SimpleHash produces IDENTICAL results on GTX 980 Ti through B200. This required careful handling of floating-point bit patterns and avoiding architecture-specific optimizations!</p>
+        </div>
+
+        <h2>ATSP: Optimal Ring Ordering</h2>
+
+        <div class="brain-power">
+            <h3>🧠 The Traveling Salesman Problem</h3>
+            <p>For ring all-reduce, peer ORDER matters. If Peer A (Tokyo) is next to Peer B (London) in the ring, every message crosses the ocean = slow!</p>
+            <p>PCCL solves the <strong>Asymmetric TSP</strong> because upload ≠ download speed.</p>
+        </div>
+
+        <h3>Why Asymmetric?</h3>
+
+        <div class="diagram">
+Asymmetric Bandwidth Example:
+─────────────────────────────────────────────────────────────────────────
+
+        Tokyo ────────────────► London
+              100 Mbps upload
+              
+        Tokyo ◄──────────────── London
+              500 Mbps download
+
+The cost Tokyo→London ≠ London→Tokyo!
+Standard TSP assumes symmetric costs - WRONG for networks.
+        </div>
+
+        <h3>ATSP Solution</h3>
+
+        <div class="diagram">
+ATSP Ring Optimization:
+─────────────────────────────────────────────────────────────────────────
+
+Input: Bandwidth matrix (measured via probing)
+┌─────────┬────────┬────────┬────────┬────────┐
+│ From\To │ Tokyo  │ Seoul  │ London │ NYC    │
+├─────────┼────────┼────────┼────────┼────────┤
+│ Tokyo   │   -    │ 800    │ 100    │ 150    │
+│ Seoul   │ 750    │   -    │ 120    │ 140    │
+│ London  │ 100    │ 110    │   -    │ 500    │
+│ NYC     │ 140    │ 130    │ 450    │   -    │
+└─────────┴────────┴────────┴────────┴────────┘
+                    (Mbps)
+
+Output: Optimal ring order
+Tokyo → Seoul → NYC → London → Tokyo
+        ↑         ↑       ↑
+      800       130     500    = min bottleneck path!
+        </div>
+
+        <div class="code-block">
+<pre><code>// ATSP solver (greedy nearest-neighbor + 2-opt improvement)
+fn solve_atsp(bandwidth: &Matrix) -> Vec<usize> {
+    // Start with greedy solution
+    let mut tour = greedy_nearest_neighbor(bandwidth);
+    
+    // Improve with 2-opt swaps
+    loop {
+        let improved = two_opt_improve(&mut tour, bandwidth);
+        if !improved { break; }
+    }
+    
+    tour
+}
+
+// Objective: maximize minimum edge (bottleneck TSP variant)
+fn tour_cost(tour: &[usize], bw: &Matrix) -> u64 {
+    tour.windows(2)
+        .map(|w| bw[w[0]][w[1]])
+        .min()
+        .unwrap()
+}</code></pre>
+        </div>
+
+        <div class="watch-it">
+            <h3>⚠️ When Topology Changes</h3>
+            <p>ATSP is re-solved when:</p>
+            <ul>
+                <li>New peer joins (need to insert in optimal position)</li>
+                <li>Peer leaves (close the gap)</li>
+                <li>Bandwidth changes significantly (periodic re-probe)</li>
+            </ul>
+        </div>
+
+        <h2>Shared State Consistency</h2>
+
+        <div class="diagram">
+Step 1: Everyone computes SimpleHash of their weights
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Peer A  │    │ Peer B  │    │ Peer C  │
+│hash=abc │    │hash=abc │    │hash=xyz │ ← Different!
+└────┬────┘    └────┬────┘    └────┬────┘
+     └──────────────┼──────────────┘
+                    ▼
+Step 2: Master identifies outlier (majority vote)
+              ┌─────────┐
+              │ MASTER  │
+              │ "C is   │
+              │  wrong!"│
+              └────┬────┘
+                   ▼
+Step 3: P2P transfer to fix C
+┌─────────┐              ┌─────────┐
+│ Peer A  │ ──────────►  │ Peer C  │
+│hash=abc │   "Here's    │hash=abc │ ← Fixed!
+└─────────┘   the data"  └─────────┘
+        </div>
+
+        <h2>Low Overhead</h2>
+
+        <table>
+            <tr><th>Operation</th><th>Latency</th><th>What It Does</th></tr>
+            <tr><td><code>updateTopology</code></td><td>0.097 ms</td><td>Accept peers, re-solve ATSP</td></tr>
+            <tr><td><code>syncSharedState</code></td><td>1.16 ms</td><td>SimpleHash + verify consensus</td></tr>
+            <tr><td><code>allReduceAsync</code></td><td>0.005 ms</td><td>Start all-reduce (non-blocking)</td></tr>
+            <tr><td><code>awaitAsyncReduce</code></td><td>7.03 ms</td><td>Wait for completion</td></tr>
+        </table>
+
+        <div class="exercise">
+            <h3>✏️ Test Your Understanding</h3>
+            <p>1. Why can't PCCL use SHA-256 for shared state verification?</p>
+            <p>2. Why is the TSP "asymmetric" for network topology?</p>
+            <p>3. What happens if SimpleHash produces different results on different GPUs?</p>
+            <div class="answer-reveal">
+                <strong>Answers:</strong><br>
+                1. SHA-256 is sequential; SimpleHash parallelizes across GPU threads<br>
+                2. Upload speed ≠ download speed (asymmetric bandwidth)<br>
+                3. Peers would appear "out of sync" when they're not - catastrophic!
+            </div>
+        </div>
+
+        <div class="mnemonic">
+            <p class="mnemonic-text">"SHAT" = SimpleHash + ATSP + Topology</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">The three pillars of PCCL architecture optimization!</p>
+        </div>
+
+        <h2>Chapter Summary</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>Master-Client:</strong> Master coordinates, peers do the work, P2P transfers data</li>
+                <li><strong>One Operation Rule:</strong> Only one major operation at a time</li>
+                <li><strong>SimpleHash:</strong> FNV-1a inspired, GPU-parallel, cross-architecture deterministic</li>
+                <li><strong>ATSP:</strong> Asymmetric TSP finds optimal ring order based on bandwidth</li>
+                <li><strong>Low Overhead:</strong> Sub-millisecond coordination latency</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter1-introduction.html" class="prev">← The Problem</a>
+            <a href="chapter3-state-machines.html" class="next">Next: State Machines →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">Master Node</div>
+            <div class="glossary-def">Coordinator that tracks membership. Doesn't touch data!</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">FNV-1a</div>
+            <div class="glossary-def">Fowler-Noll-Vo hash. Fast, simple, good distribution. Basis for SimpleHash.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Warp</div>
+            <div class="glossary-def">32 GPU threads executing in lockstep. Enables shuffle operations.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">__shfl_down_sync</div>
+            <div class="glossary-def">CUDA intrinsic. Threads exchange values within a warp without shared memory.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">ATSP</div>
+            <div class="glossary-def">Asymmetric Traveling Salesman Problem. Find shortest tour with directional costs.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">2-opt</div>
+            <div class="glossary-def">TSP improvement heuristic. Swap edges to reduce tour cost.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Bottleneck TSP</div>
+            <div class="glossary-def">Variant that maximizes the minimum edge. Used for bandwidth optimization.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Micro-Consensus</div>
+            <div class="glossary-def">All peers must agree before any state change.</div>
+        </div>
+    </aside>
+</body>
+</html>

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 1: The Problem - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html" class="active">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+
+    <main class="content">
+        <h1>Chapter 1: The Problem</h1>
+        <p class="subtitle">Why existing tools fail on the internet</p>
+
+        <div class="analogy-box">
+            <h3>🐱 The Cat Herding Problem</h3>
+            <p>Imagine you're herding 100 cats from New York to Los Angeles. Traditional approach (NCCL/MPI):</p>
+            <ul>
+                <li>All cats must start at the same time</li>
+                <li>If ONE cat wanders off, ALL cats go back to New York</li>
+                <li>No new cats can join mid-journey</li>
+                <li>Assumes all cats walk at the same speed on a private road</li>
+            </ul>
+            <p><strong>Now try this on the PUBLIC INTERNET where cats randomly disappear, new cats want to join, and the "road" is shared with millions of other travelers.</strong></p>
+            <p>That's why we need PCCL. 🐱➡️🎯</p>
+        </div>
+
+        <h2>The Traditional Players</h2>
+
+        <div class="fireside-chat">
+            <div class="chat-message">
+                <span class="chat-speaker">NCCL:</span> "I'm the king of GPU communication. NVLink? InfiniBand? I OWN those."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">MPI:</span> "I've been doing this since the 90s. Supercomputers love me."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Internet:</span> "Cool. What happens when a node dies?"
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">NCCL:</span> "...everyone dies. It's called collective failure."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">MPI:</span> "Same. We restart from checkpoint. It's fine."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Internet:</span> "I have 1000 nodes. One fails every 10 minutes on average."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">NCCL & MPI:</span> "..."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">PCCL:</span> "I got this. Failed node? Kick it out, keep training. New node? Welcome aboard, here's the current state."
+            </div>
+        </div>
+
+        <h2>What Traditional Libraries Assume</h2>
+
+        <table>
+            <tr>
+                <th>Assumption</th>
+                <th>HPC Reality</th>
+                <th>Internet Reality</th>
+            </tr>
+            <tr>
+                <td>All nodes start together</td>
+                <td>✅ Yes</td>
+                <td>❌ Nodes join/leave anytime</td>
+            </tr>
+            <tr>
+                <td>Nodes never fail</td>
+                <td>✅ Rare failures</td>
+                <td>❌ Failures are COMMON</td>
+            </tr>
+            <tr>
+                <td>Network is fast & reliable</td>
+                <td>✅ InfiniBand, NVLink</td>
+                <td>❌ Variable latency, packet loss</td>
+            </tr>
+            <tr>
+                <td>Homogeneous hardware</td>
+                <td>✅ Same GPUs everywhere</td>
+                <td>❌ Mix of hardware</td>
+            </tr>
+            <tr>
+                <td>Private network</td>
+                <td>✅ Dedicated switches</td>
+                <td>❌ Shared internet</td>
+            </tr>
+        </table>
+
+        <div class="watch-it">
+            <h3>The Restart Tax</h3>
+            <p>With traditional libraries, every failure = restart from checkpoint.</p>
+            <p><strong>Math time:</strong> If you have 1000 nodes and each has 0.1% chance of failing per hour:</p>
+            <ul>
+                <li>Probability of NO failures in 1 hour: 0.999^1000 = 36.8%</li>
+                <li>Expected time between failures: ~1 hour</li>
+                <li>If checkpoint takes 10 min and restart takes 5 min...</li>
+                <li><strong>You spend 25% of your time NOT training!</strong></li>
+            </ul>
+        </div>
+
+        <h2>PCCL's Key Insight</h2>
+
+        <div class="remember-this">
+            <h3>💡 The Determinism Trick</h3>
+            <p>Most optimizers (SGD, Adam, AdamW) are <strong>deterministic</strong>. Given:</p>
+            <ol>
+                <li>Same starting weights</li>
+                <li>Same gradient (from all-reduce)</li>
+                <li>Same optimizer step</li>
+            </ol>
+            <p>All peers will have <strong>BIT-IDENTICAL</strong> weights after the update!</p>
+            <p>This means: <strong>No extra sync needed</strong> - just ensure all-reduce gives same result to everyone.</p>
+        </div>
+
+        <div class="diagram">
+Before All-Reduce:
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Peer A  │    │ Peer B  │    │ Peer C  │
+│ grad=1  │    │ grad=2  │    │ grad=3  │
+│ θ=100   │    │ θ=100   │    │ θ=100   │
+└─────────┘    └─────────┘    └─────────┘
+
+After All-Reduce (avg gradient = 2):
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Peer A  │    │ Peer B  │    │ Peer C  │
+│ grad=2  │    │ grad=2  │    │ grad=2  │  ← Same!
+│ θ=100   │    │ θ=100   │    │ θ=100   │
+└─────────┘    └─────────┘    └─────────┘
+
+After Optimizer Step (lr=0.1):
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Peer A  │    │ Peer B  │    │ Peer C  │
+│ θ=99.8  │    │ θ=99.8  │    │ θ=99.8  │  ← Identical!
+└─────────┘    └─────────┘    └─────────┘
+        </div>
+
+        <h2>What PCCL Does Differently</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>Dynamic Membership:</strong> Peers join/leave without restarting</li>
+                <li><strong>Fault Tolerance:</strong> One peer dies? Kick it out, continue training</li>
+                <li><strong>Bit-Identical State:</strong> Hash-based verification ensures everyone's in sync</li>
+                <li><strong>WAN Optimized:</strong> Multiple TCP connections for maximum bandwidth</li>
+                <li><strong>Master-Client Model:</strong> Lightweight coordinator, no single point of failure for data</li>
+            </ul>
+        </div>
+
+        <div class="no-dumb-questions">
+            <p><strong>Q: If the master dies, doesn't everything stop?</strong></p>
+            <p>A: Yes, but the master is LIGHTWEIGHT - it just coordinates, doesn't hold data. You can restart it and peers reconnect. Your model weights are safe on the peers!</p>
+            
+            <p><strong>Q: Why not just use a VPN to make internet look like LAN?</strong></p>
+            <p>A: VPNs add latency and don't solve the fault tolerance problem. NCCL over VPN still crashes when a node dies.</p>
+            
+            <p><strong>Q: Is PCCL slower than NCCL?</strong></p>
+            <p>A: On a dedicated HPC cluster? Yes, slightly. Over the internet? PCCL is the ONLY option that works reliably!</p>
+        </div>
+
+        <h2>Real-World Impact</h2>
+
+        <div class="trivia">
+            <p><strong>INTELLECT-1</strong> was trained using PCCL's predecessor across the public internet. The team at Prime Intellect learned the hard way that existing tools don't work - that's why they built PCCL!</p>
+        </div>
+
+        <div class="exercise">
+            <h3>Think About It</h3>
+            <p>You're training a model on 50 spot instances (cheap but can be terminated anytime). On average, 2 instances get terminated per hour.</p>
+            <p><strong>With traditional library:</strong> How many restarts per 8-hour training run?</p>
+            <p><strong>With PCCL:</strong> How many restarts?</p>
+            
+            <div class="answer-reveal">
+                <strong>Traditional:</strong> 2 × 8 = 16 restarts (assuming each termination = restart)<br>
+                <strong>PCCL:</strong> 0 restarts - terminated instances are just removed, training continues!
+            </div>
+        </div>
+
+        <div class="mnemonic">
+            <p class="mnemonic-text">"PCCL = Peers Can Come & Leave"</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">The core feature that makes PCCL special!</p>
+        </div>
+
+        <h2>Chapter Summary</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li>Traditional libraries (NCCL, MPI) assume stable, homogeneous HPC clusters</li>
+                <li>Internet training breaks ALL those assumptions</li>
+                <li>PCCL exploits optimizer determinism for bit-identical state</li>
+                <li>Dynamic membership + fault tolerance = training that survives chaos</li>
+                <li>The "restart tax" of traditional libraries is eliminated</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter0-prerequisites.html" class="prev">← Prerequisites</a>
+            <a href="chapter2-architecture.html" class="next">Next: Architecture →</a>
+        </div>
+    </main>
+
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">NCCL</div>
+            <div class="glossary-def">NVIDIA Collective Communications Library. Fast but assumes stable cluster.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">MPI</div>
+            <div class="glossary-def">Message Passing Interface. The OG of distributed computing since 1990s.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">HPC</div>
+            <div class="glossary-def">High Performance Computing. Fancy clusters with expensive networking.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">InfiniBand</div>
+            <div class="glossary-def">Super-fast networking for HPC. 200+ Gbps. Expensive!</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">NVLink</div>
+            <div class="glossary-def">NVIDIA's GPU-to-GPU interconnect. Even faster than InfiniBand for GPU communication.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Checkpoint</div>
+            <div class="glossary-def">Saved snapshot of model state. Used to resume after failures.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Spot Instance</div>
+            <div class="glossary-def">Cheap cloud compute that can be terminated anytime. 70-90% cheaper!</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Deterministic</div>
+            <div class="glossary-def">Same input → same output, always. No randomness involved.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Peer Churn</div>
+            <div class="glossary-def">Nodes joining and leaving the cluster. The bane of traditional libraries.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">State Divergence</div>
+            <div class="glossary-def">When peers have different weights. BAD - means training is broken.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Bit-Identical</div>
+            <div class="glossary-def">Exactly the same at binary level. Not "close" - EXACTLY the same.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Restart Tax</div>
+            <div class="glossary-def">Time wasted restarting after failures. Can be 25%+ of total time!</div>
+        </div>
+    </aside>
+</body>
+</html>

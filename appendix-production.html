@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Appendix B: Production Notes - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+            <li><a href="appendix-production.html" class="active">B. Production Notes</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Appendix B: Production Notes</h1>
+        <p class="subtitle">What the Paper Authors Learned the Hard Way</p>
+
+        <div class="watch-it" style="background: #f8d7da; border-left: 4px solid #dc3545; padding: 1rem;">
+            <h3>🔴 READ THIS BEFORE DEPLOYING</h3>
+            <p>This appendix contains critical operational details from the PCCL paper that are easy to miss but essential for production deployments.</p>
+        </div>
+
+        <h2>1. Connection Pool Sizing</h2>
+
+        <div class="watch-it" style="background: #fff3cd; border-left: 4px solid #ffc107;">
+            <h3>⚠️ CRITICAL: Single Connection = 90% Bandwidth Loss</h3>
+            <p>From paper Section 6.2:</p>
+            <ul>
+                <li>Europe West: 1 conn = 3.6 Gbit/s → 64 conn = 45 Gbit/s</li>
+                <li>Cross-continental: 1 conn = ~5 Gbit/s → 100 conn = 40+ Gbit/s</li>
+            </ul>
+            <p><strong>Recommendation:</strong> Start with 64 connections, tune based on your network.</p>
+        </div>
+
+        <h2>2. Platform-Specific Quirks</h2>
+
+        <p>From paper Section 5.1:</p>
+
+        <table>
+            <tr>
+                <th>Platform</th>
+                <th>Issue</th>
+                <th>Workaround</th>
+            </tr>
+            <tr>
+                <td><strong>macOS (XNU)</strong></td>
+                <td>Send buffer exhaustion handling bugs</td>
+                <td>PCCL has workarounds; monitor for hangs</td>
+            </tr>
+            <tr>
+                <td><strong>Windows (WSA)</strong></td>
+                <td>Drastically different error codes</td>
+                <td>PCCL handles internally</td>
+            </tr>
+            <tr>
+                <td><strong>Windows</strong></td>
+                <td>Half-close drain behavior differs</td>
+                <td>PCCL handles internally</td>
+            </tr>
+            <tr>
+                <td><strong>Docker</strong></td>
+                <td>Socket implementation quirks in containers</td>
+                <td>Test thoroughly in your container setup</td>
+            </tr>
+            <tr>
+                <td><strong>All platforms</strong></td>
+                <td>recv() blocking behavior varies with close()/shutdown()</td>
+                <td>PCCL handles internally</td>
+            </tr>
+        </table>
+
+        <div class="remember-this">
+            <h3>💡 The Paper's Advice</h3>
+            <p>"We relied on extensive CI testing and long-running stress testing simulating extreme conditions of peer churn to validate behavior."</p>
+            <p><strong>Translation:</strong> They found bugs by running 8-hour stress tests. You should too.</p>
+        </div>
+
+        <h2>3. Scheduler Sensitivity</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ PCCL is Latency-Sensitive</h3>
+            <p>From paper Section 6.1:</p>
+            <blockquote>
+                "PCCL must perform many futex syscalls during the course of performing a collective operation. Thus PCCL is more sensitive to OS scheduler-induced latencies and achieved throughput is therefore subject to higher variance."
+            </blockquote>
+        </div>
+
+        <p><strong>Implications:</strong></p>
+        <ul>
+            <li>Avoid noisy neighbors on shared VMs</li>
+            <li>Consider CPU pinning for PCCL threads</li>
+            <li>Monitor for throughput variance</li>
+            <li>Dedicated instances recommended for production</li>
+        </ul>
+
+        <h2>4. Async DiLoCo: The Full Algorithm</h2>
+
+        <p>The simplified version in Chapter 6 omits critical peer-churn handling. Here's what actually happens:</p>
+
+        <div class="diagram">
+Async DiLoCo with Peer Churn (Paper Algorithm 4):
+─────────────────────────────────────────────────────────────────────────
+
+When new peer joins mid-training:
+
+1. Check are_peers_pending() [micro-consensus, no I/O overhead]
+   │
+2. If pending peers exist:
+   │
+   ├─► Wait for in-flight all-reduce to complete
+   │
+   ├─► updateTopology() - accept new peers
+   │
+   ├─► syncSharedState(enforcePopular) - sync aggregator params
+   │
+   └─► θ_local ← θ_global
+
+3. After outer optimizer step (for existing peers):
+   │
+   └─► syncSharedState(sendOnly) - provide result to newcomers
+
+4. For newcomers who missed previous all-reduce:
+   │
+   └─► syncSharedState(receiveOnly) - "eavesdrop" on result
+        </div>
+
+        <div class="watch-it">
+            <h3>⚠️ Two Shared State Syncs Required</h3>
+            <p>When peers join, you need TWO syncSharedState calls:</p>
+            <ol>
+                <li><code>enforcePopular</code> - Initial sync when peer joins</li>
+                <li><code>sendOnly/receiveOnly</code> - Provide result of all-reduce newcomer missed</li>
+            </ol>
+            <p>The second sync uses <code>sendOnly</code> for existing peers and <code>receiveOnly</code> for newcomers to prevent newcomers' state from being chosen if more newcomers than existing peers.</p>
+        </div>
+
+        <h2>5. Quantization Determinism Tradeoff</h2>
+
+        <p>From paper Section 5.3.1:</p>
+
+        <div class="code-block">
+<pre><code>// The problem:
+D(Q(x)) ≠ x
+
+// Dequantization doesn't recover original values.
+// Each peer has higher precision for its OWN contribution.
+
+// Option A: Discard extra precision (bit-identical)
+// Option B: Keep extra precision (better approximation as world_size grows)
+
+// PCCL chooses Option A for determinism.</code></pre>
+        </div>
+
+        <div class="remember-this">
+            <h3>💡 "Lingering Precision"</h3>
+            <p>If you keep the extra precision from local data, the fully-reduced result on peer A will differ from peer B by the precision that A has for its own contribution but B doesn't have.</p>
+            <p>PCCL discards this to maintain bit-identical results across all peers.</p>
+        </div>
+
+        <h2>6. PTX Determinism Verification</h2>
+
+        <p>The paper verified <code>__nv_expf</code> produces identical bits across:</p>
+        <ul>
+            <li>GTX 980 Ti (sm_52)</li>
+            <li>GTX 1060 (sm_61)</li>
+            <li>RTX 4090 (sm_89)</li>
+            <li>GH 200 (sm_90)</li>
+            <li>B200 (sm_100)</li>
+        </ul>
+
+        <p>Test: Hash output bits across all 2^32 float bit-patterns. Result:</p>
+        <div class="code-block">
+<pre><code>Sum of bits: 4602279786742895247
+XOR of bits: 0x45ABDA35
+
+// Identical on ALL tested architectures!</code></pre>
+        </div>
+
+        <div class="watch-it">
+            <h3>⚠️ Not All PTX is Deterministic</h3>
+            <p>NVIDIA provides only a "soft guarantee" of forward compatibility. Some intrinsics may behave differently across architectures. The paper only verified <code>__nv_expf</code>.</p>
+            <p>If your outer optimizer uses other intrinsics, verify them yourself.</p>
+        </div>
+
+        <h2>7. threadpark: Why C++ Primitives Weren't Enough</h2>
+
+        <p>From paper Section 5.2:</p>
+
+        <blockquote>
+            "C++ synchronization primitives such as condition variables proved insufficient in terms of wake-up latency."
+        </blockquote>
+
+        <p>PCCL uses custom <code>threadpark</code> library with:</p>
+        <ul>
+            <li>Linux: <code>futex</code></li>
+            <li>macOS: <code>__ulock_wait</code></li>
+            <li>Windows: <code>WakeByAddressSingle</code></li>
+            <li>FreeBSD/OpenBSD: futex equivalents</li>
+        </ul>
+
+        <p><strong>Implication:</strong> If you're debugging latency issues, standard profiling tools may not show the full picture.</p>
+
+        <h2>8. Zero-Malloc Policy</h2>
+
+        <p>From paper Section 5.3:</p>
+
+        <blockquote>
+            "The multi-threaded nature of the algorithm paired with a strictly necessary zero-malloc policy for the reduce code path necessitated a custom caching allocator."
+        </blockquote>
+
+        <p><strong>Why it matters:</strong></p>
+        <ul>
+            <li>No <code>malloc()</code>/<code>free()</code> in hot path</li>
+            <li>No page faults from lazy initialization</li>
+            <li>Custom allocator pre-allocates and caches</li>
+        </ul>
+
+        <p>If you're integrating PCCL with other libraries that allocate during collectives, expect performance degradation.</p>
+
+        <h2>9. Abort Signal Propagation</h2>
+
+        <div class="diagram">
+How PCCL Checks for Aborts Without I/O Overhead:
+─────────────────────────────────────────────────────────────────────────
+
+Master connection is SEPARATE TCP stream.
+Abort signal pushed from SEPARATE thread.
+
+During collective:
+┌─────────────────────────────────────────────────────────────────────┐
+│  while (!doneSend && !doneRecv) {                                   │
+│      try_send_next_chunk(peerTx, txSpan);                          │
+│      try_recv_next_chunk(peerRx, recvBuf);                         │
+│                                                                     │
+│      if (new_chunk_arrived) {                                       │
+│          reduce_into(rxSpan, recvBuf);                             │
+│                                                                     │
+│          // THIS IS THE KEY: No I/O, just check queue              │
+│          abortReceived = masterSocket.recvQueue.pop();             │
+│          if (abortReceived) return ABORTED;                        │
+│      }                                                              │
+│  }                                                                  │
+└─────────────────────────────────────────────────────────────────────┘
+
+The abort check is "largely free" because it's just a queue pop.
+        </div>
+
+        <h2>10. Recovery Time Expectations</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ No Specific Recovery Time Claimed</h3>
+            <p>The paper does NOT claim "250ms recovery time" or similar specific numbers.</p>
+            <p>What it DOES say:</p>
+            <blockquote>
+                "PCCL's error paths in comparison are roughly equally fast as the success paths and do not require dedicated rollback mechanisms."
+            </blockquote>
+            <p>Translation: Recovery is fast, but actual time depends on your network and operation size.</p>
+        </div>
+
+        <h2>Production Checklist</h2>
+
+        <div class="exercise">
+            <h3>✅ Before Going Live</h3>
+            <ol>
+                <li>☐ Connection pool sized appropriately (start with 64)</li>
+                <li>☐ Stress tested for 8+ hours with peer churn</li>
+                <li>☐ Platform-specific quirks understood</li>
+                <li>☐ Scheduler sensitivity addressed (dedicated instances?)</li>
+                <li>☐ Async DiLoCo peer-churn handling implemented correctly</li>
+                <li>☐ Quantization determinism tradeoffs understood</li>
+                <li>☐ Monitoring for throughput variance in place</li>
+                <li>☐ Rollback plan documented</li>
+            </ol>
+        </div>
+
+        <div class="navigation">
+            <a href="appendix-alternatives.html" class="prev">← Alternatives</a>
+            <a href="index.html" class="next">Back to Index →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">futex</div>
+            <div class="glossary-def">Fast userspace mutex. Linux syscall for low-latency synchronization.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">__ulock_wait</div>
+            <div class="glossary-def">macOS equivalent of futex. Undocumented but used by PCCL.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">WSA</div>
+            <div class="glossary-def">Windows Sockets API. Different error codes than BSD sockets.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">XNU</div>
+            <div class="glossary-def">macOS kernel. Has quirks with send buffer exhaustion.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">enforcePopular</div>
+            <div class="glossary-def">Sync strategy: majority hash wins. Default for most syncs.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">sendOnly/receiveOnly</div>
+            <div class="glossary-def">Sync strategies for newcomer integration. Prevents newcomer state from being chosen.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Lingering Precision</div>
+            <div class="glossary-def">Extra precision from local data that other peers don't have. Discarded for determinism.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">PTX</div>
+            <div class="glossary-def">Parallel Thread Execution. NVIDIA's intermediate representation for GPU code.</div>
+        </div>
+    </aside>
+</body>
+</html>

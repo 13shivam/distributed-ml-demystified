@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 6: DiLoCo Family - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html" class="active">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+
+    <main class="content">
+        <h1>Chapter 6: The DiLoCo Family</h1>
+        <p class="subtitle">From DDP to Async DiLoCo - A Communication Diet</p>
+
+        <div class="analogy-box">
+            <h3>📞 The Long-Distance Relationship Analogy</h3>
+            <p>Imagine you're in a long-distance relationship:</p>
+            <ul>
+                <li><strong>DDP:</strong> Video call 24/7. Great connection, but your internet bill is INSANE.</li>
+                <li><strong>DiLoCo:</strong> One video call per week. Catch up on everything, then live your life.</li>
+                <li><strong>Async DiLoCo:</strong> Send a video message while doing other stuff. Watch their reply later.</li>
+            </ul>
+            <p>Same relationship, different communication patterns. Choose based on your "bandwidth budget"!</p>
+        </div>
+
+        <h2>The Communication Spectrum</h2>
+
+        <div class="diagram">
+Communication Frequency:
+
+HIGH ◄─────────────────────────────────────────────► LOW
+ │                                                    │
+ │    DDP          DiLoCo (H=10)    DiLoCo (H=500)   │
+ │     │                │                 │          │
+ │  Every step     Every 10 steps   Every 500 steps  │
+ │                                                    │
+ │  Best for:      Best for:        Best for:        │
+ │  - LAN/HPC      - Fast WAN       - Slow WAN       │
+ │  - Low latency  - Medium latency - High latency   │
+ └────────────────────────────────────────────────────┘
+        </div>
+
+        <h2>Algorithm 1: DDP (Distributed Data Parallel)</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ NOT Recommended for Internet Training!</h3>
+            <p>DDP synchronizes gradients EVERY step. Over the internet, this is painfully slow. Included here as a baseline only.</p>
+        </div>
+
+        <pre><code># DDP: Communicate every step
+for batch in data_loader:
+    # 1. Forward & backward
+    loss = model(batch)
+    loss.backward()
+    
+    # 2. All-reduce gradients (EVERY STEP!)
+    all_reduce(model.gradients, op=AVG)
+    
+    # 3. Update weights
+    optimizer.step()
+    optimizer.zero_grad()</code></pre>
+
+        <div class="fireside-chat">
+            <div class="chat-message">
+                <span class="chat-speaker">DDP:</span> "I sync every step. My gradients are always fresh!"
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Internet:</span> "That's 100ms latency per step. Your training will take forever."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">DDP:</span> "But... accuracy..."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">DiLoCo:</span> "I sync every 500 steps and get similar accuracy. Math checks out."
+            </div>
+        </div>
+
+        <h2>Algorithm 2: DiLoCo (Distributed Low-Communication)</h2>
+
+        <div class="remember-this">
+            <h3>💡 The Key Insight</h3>
+            <p>Instead of syncing gradients, sync <strong>parameter differences</strong> (pseudo-gradients) every H steps.</p>
+            <p>Each peer trains locally for H steps, then they compare notes!</p>
+        </div>
+
+        <div class="diagram">
+DiLoCo Structure:
+
+┌─────────────────────────────────────────────────────────┐
+│                    INNER LOOP (H steps)                 │
+│                    No communication!                    │
+│                                                         │
+│   for i in range(H):                                    │
+│       loss = forward_backward(θ_local, batch)           │
+│       inner_optimizer.step()  # e.g., AdamW             │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                    OUTER STEP                           │
+│                    Synchronize!                         │
+│                                                         │
+│   Δ = θ_global - θ_local      # "How far did I drift?" │
+│   all_reduce(Δ, op=AVG)       # Average everyone's Δ   │
+│   outer_optimizer.step(θ_global, Δ)  # e.g., Nesterov  │
+│   θ_local = θ_global          # Reset local to global  │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+        </div>
+
+        <pre><code># DiLoCo: Communicate every H steps
+for outer_step in range(max_outer_steps):
+    # Update topology, sync state
+    comm.update_topology()
+    comm.sync_shared_state(shared_state)
+    
+    # INNER LOOP: H local steps, NO communication
+    for i in range(H):
+        batch = data_loader.next()
+        loss = model(batch)
+        loss.backward()
+        inner_optimizer.step()
+        inner_optimizer.zero_grad()
+    
+    # OUTER STEP: Compute and sync pseudo-gradients
+    delta = theta_global - theta_local  # Parameter difference
+    all_reduce(delta, op=AVG)
+    
+    outer_optimizer.step(theta_global, delta)  # Nesterov momentum
+    theta_local = theta_global.clone()  # Reset local model</code></pre>
+
+        <div class="no-dumb-questions">
+            <p><strong>Q: Why two optimizers?</strong></p>
+            <p>A: Inner optimizer (AdamW) handles local training. Outer optimizer (Nesterov) handles global synchronization. They serve different purposes!</p>
+            
+            <p><strong>Q: What's a good value for H?</strong></p>
+            <p>A: Depends on your network! H=1 with SGD outer ≈ DDP. H=500 is common for internet training. Experiment!</p>
+            
+            <p><strong>Q: Does accuracy suffer with high H?</strong></p>
+            <p>A: Slightly, but the speedup is worth it. The DiLoCo paper shows it works surprisingly well!</p>
+        </div>
+
+        <h2>Algorithm 3: Async DiLoCo</h2>
+
+        <div class="brain-power">
+            <h3>🧠 The Brilliant Trick</h3>
+            <p>What if we could do the all-reduce IN THE BACKGROUND while training continues?</p>
+            <p><strong>Async DiLoCo:</strong> Apply the PREVIOUS iteration's result while computing the CURRENT one!</p>
+        </div>
+
+        <div class="diagram">
+Async DiLoCo Timeline:
+
+Time ──────────────────────────────────────────────────────►
+
+Outer Step 1:
+├── Inner training (H steps) ──┤
+                               ├── All-reduce Δ₁ (background) ──┤
+                               
+Outer Step 2:
+                               ├── Inner training (H steps) ──┤
+                               │                              │
+                               │   Apply Δ₁ result here! ─────┤
+                                                              ├── All-reduce Δ₂ ──┤
+
+Outer Step 3:
+                                                              ├── Inner training ──┤
+                                                              │                    │
+                                                              │   Apply Δ₂ here! ──┤
+
+Communication is HIDDEN behind compute!
+        </div>
+
+        <pre><code># Async DiLoCo: Overlap communication with compute
+delta_prev = zeros()  # Previous iteration's delta
+active_thread = None
+
+for outer_step in range(max_outer_steps):
+    # Check for new peers (can't overlap with collectives!)
+    if comm.are_peers_pending():
+        await_async_all_reduce(delta_prev)  # Finish current
+        comm.update_topology()
+        comm.sync_shared_state(shared_state)
+    
+    # INNER LOOP: Local training
+    for i in range(H):
+        batch = data_loader.next()
+        loss = model(batch)
+        loss.backward()
+        inner_optimizer.step()
+    
+    # Wait for PREVIOUS all-reduce to complete
+    await_async_all_reduce(delta_prev)
+    
+    # Compute CURRENT delta
+    delta_current = theta_global - theta_local
+    
+    # Start CURRENT all-reduce in background
+    async_all_reduce(delta_current)
+    
+    # Apply PREVIOUS result (one-step delay!)
+    if delta_prev.is_finished():
+        outer_optimizer.step(theta_global, delta_prev)
+        theta_local = theta_global.clone()</code></pre>
+
+        <div class="watch-it">
+            <h3>⚠️ Peer Churn Complicates Things!</h3>
+            <p>When new peers join during async DiLoCo:</p>
+            <ol>
+                <li>Wait for in-flight all-reduce to complete</li>
+                <li>Accept new peers</li>
+                <li>Sync shared state (newcomer gets current global state)</li>
+                <li>Extra sync so newcomer "eavesdrops" on previous result</li>
+            </ol>
+            <p>It's complex, but PCCL handles it!</p>
+        </div>
+
+        <h2>Comparison Table</h2>
+
+        <table>
+            <tr>
+                <th>Algorithm</th>
+                <th>Communication</th>
+                <th>Latency Hiding</th>
+                <th>Complexity</th>
+                <th>Best For</th>
+            </tr>
+            <tr>
+                <td>DDP</td>
+                <td>Every step</td>
+                <td>None</td>
+                <td>Simple</td>
+                <td>LAN/HPC</td>
+            </tr>
+            <tr>
+                <td>DiLoCo</td>
+                <td>Every H steps</td>
+                <td>None</td>
+                <td>Medium</td>
+                <td>WAN</td>
+            </tr>
+            <tr>
+                <td>Async DiLoCo</td>
+                <td>Every H steps</td>
+                <td>Complete!</td>
+                <td>Complex</td>
+                <td>Slow WAN</td>
+            </tr>
+        </table>
+
+        <div class="exercise">
+            <h3>✏️ Choose the Right Algorithm</h3>
+            <p>Match the scenario to the best algorithm:</p>
+            <ol>
+                <li>8 GPUs in same datacenter, NVLink connected</li>
+                <li>50 nodes across US and Europe, 100ms latency</li>
+                <li>100 spot instances, variable connectivity</li>
+            </ol>
+            
+            <div class="answer-reveal">
+                <strong>Answers:</strong><br>
+                1. DDP - Low latency, might as well sync every step<br>
+                2. DiLoCo - Reduce communication, H=100-500<br>
+                3. Async DiLoCo - Hide latency, handle churn gracefully
+            </div>
+        </div>
+
+        <div class="trivia">
+            <p><strong>The name "DiLoCo"</strong> stands for <strong>Di</strong>stributed <strong>Lo</strong>w-<strong>Co</strong>mmunication. It was introduced by Douillard et al. in 2024 and is inspired by federated learning techniques!</p>
+        </div>
+
+        <div class="mnemonic">
+            <p class="mnemonic-text">"DDP = Daily, DiLoCo = Weekly, Async = While You Sleep"</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">Communication frequency analogy!</p>
+        </div>
+
+        <h2>Chapter Summary</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>DDP:</strong> Sync every step. Simple but slow over WAN.</li>
+                <li><strong>DiLoCo:</strong> Sync every H steps. Inner optimizer + outer optimizer.</li>
+                <li><strong>Async DiLoCo:</strong> Overlap communication with compute. One-step delay.</li>
+                <li><strong>Peer Churn:</strong> Async DiLoCo needs extra sync steps for newcomers.</li>
+                <li><strong>Choose wisely:</strong> Match algorithm to your network characteristics!</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter5-fault-tolerance.html" class="prev">← Fault Tolerance</a>
+            <a href="chapter7-implementation.html" class="next">Next: Implementation →</a>
+        </div>
+    </main>
+
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">DDP</div>
+            <div class="glossary-def">Distributed Data Parallel. Sync gradients every step. The "default" approach.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">DiLoCo</div>
+            <div class="glossary-def">Distributed Low-Communication. Sync every H steps instead of every step.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Async DiLoCo</div>
+            <div class="glossary-def">DiLoCo with overlapped communication. Apply previous result while computing current.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Inner Optimizer</div>
+            <div class="glossary-def">Optimizer for local training (e.g., AdamW). Runs every step.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Outer Optimizer</div>
+            <div class="glossary-def">Optimizer for global sync (e.g., Nesterov). Runs every H steps.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Pseudo-Gradient</div>
+            <div class="glossary-def">Parameter difference (θ_global - θ_local). Treated like a gradient for outer optimizer.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">H (Inner Steps)</div>
+            <div class="glossary-def">Number of local training steps between syncs. Higher H = less communication.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Nesterov Momentum</div>
+            <div class="glossary-def">Optimizer that "looks ahead" before stepping. Common outer optimizer for DiLoCo.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">One-Step Delay</div>
+            <div class="glossary-def">In Async DiLoCo, applying result from previous iteration. Enables overlap.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Federated Learning</div>
+            <div class="glossary-def">Training on distributed data without centralizing it. DiLoCo is inspired by this.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Local SGD</div>
+            <div class="glossary-def">Family of algorithms where peers train locally then sync. DiLoCo is a variant.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Eavesdrop</div>
+            <div class="glossary-def">New peer receiving result of all-reduce it didn't participate in. For sync.</div>
+        </div>
+    </aside>
+</body>
+</html>

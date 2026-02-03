@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PCCL: Head First Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html" class="active">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+            <li><a href="appendix-production.html">B. Production Notes</a></li>
+        </ul>
+    </nav>
+
+    <main class="content">
+        <h1>🚀 Prime Collective Communications Library</h1>
+        <p class="subtitle">A Head First Guide to Fault-Tolerant Distributed ML</p>
+
+        <div class="paper-info">
+            <p><strong>📄 Original Paper:</strong> arXiv:2505.14065</p>
+            <p><strong>👥 Authors:</strong> Keiblinger, Sieg, Ong, Jaghouar, Hagemann @ Prime Intellect</p>
+            <p><strong>📖 eBook Compiled & Designed for Simplicity by:</strong> <a href="https://github.com/13shivam" target="_blank">13shivam</a></p>
+            <p><strong>📜 License:</strong> MIT (Open Source)</p>
+        </div>
+
+        <div class="analogy-box">
+            <h3>What if training a neural network was like...</h3>
+            <p>...herding cats across the internet, where cats randomly disappear, new cats join mid-journey, and somehow ALL cats need to arrive at the same destination with the EXACT same memories?</p>
+            <p><strong>That's distributed ML training. And PCCL is your cat-herding superpower.</strong></p>
+        </div>
+
+        <h2>What You'll Learn</h2>
+        
+        <div class="feature-grid">
+            <div class="feature">
+                <h3>🧠 Core Concepts</h3>
+                <p>Master-client architecture, state machines, micro-consensus</p>
+            </div>
+            <div class="feature">
+                <h3>🔄 Algorithms</h3>
+                <p>Ring all-reduce, DiLoCo, Async DiLoCo with peer churn</p>
+            </div>
+            <div class="feature">
+                <h3>💥 Fault Tolerance</h3>
+                <p>What happens when things go wrong (and how PCCL survives)</p>
+            </div>
+            <div class="feature">
+                <h3>🛠️ Build It</h3>
+                <p>Practical code in Rust, C++, Python to build your own</p>
+            </div>
+        </div>
+
+        <div class="brain-power">
+            <h3>How This Book Works</h3>
+            <p>This isn't a boring technical manual. We use <strong>cognitive science</strong> to make concepts stick:</p>
+            <ul>
+                <li>🎭 <strong>Analogies</strong> - Complex ideas explained with everyday examples</li>
+                <li>🔥 <strong>Fireside Chats</strong> - Concepts "debate" each other</li>
+                <li>✏️ <strong>Exercises</strong> - Test yourself before moving on</li>
+                <li>⚠️ <strong>Watch It!</strong> - Common mistakes to avoid</li>
+                <li>📖 <strong>Glossary</strong> - Fancy words explained (right sidebar →)</li>
+            </ul>
+        </div>
+
+        <h2>Quick Start: Which Chapter?</h2>
+        
+        <table>
+            <tr>
+                <th>If you want to...</th>
+                <th>Go to...</th>
+            </tr>
+            <tr>
+                <td>Understand WHY PCCL exists</td>
+                <td><a href="chapter1-introduction.html">Chapter 1: The Problem</a></td>
+            </tr>
+            <tr>
+                <td>See how it's architected</td>
+                <td><a href="chapter2-architecture.html">Chapter 2: Architecture</a></td>
+            </tr>
+            <tr>
+                <td>Learn the math behind all-reduce</td>
+                <td><a href="chapter4-ring-allreduce.html">Chapter 4: Ring All-Reduce</a></td>
+            </tr>
+            <tr>
+                <td>Implement DiLoCo training</td>
+                <td><a href="chapter6-diloco.html">Chapter 6: DiLoCo Family</a></td>
+            </tr>
+            <tr>
+                <td>Build your own PCCL</td>
+                <td><a href="chapter9-build-your-own.html">Chapter 9: Build Your Own</a></td>
+            </tr>
+        </table>
+
+        <div class="remember-this">
+            <h3>The One Thing to Remember</h3>
+            <p>PCCL's secret sauce: <strong>restrict what's allowed</strong>. By limiting operations to one-at-a-time with explicit consensus, fault tolerance becomes tractable. Previous attempts failed because they were too permissive!</p>
+        </div>
+
+        <div class="trivia">
+            <p><strong>PCCL achieved 45 Gbit/s</strong> bandwidth utilization across Western Europe using 128 concurrent TCP connections. That's like downloading a 4K movie every 0.7 seconds... while training an AI!</p>
+        </div>
+
+        <div class="navigation">
+            <span></span>
+            <a href="chapter0-prerequisites.html" class="next">Start Learning: Prerequisites →</a>
+        </div>
+    </main>
+
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">PCCL</div>
+            <div class="glossary-def">Prime Collective Communications Library - the star of this book!</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Fault-Tolerant</div>
+            <div class="glossary-def">System keeps working even when parts fail. Like a car that drives with a flat tire.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Collective Communication</div>
+            <div class="glossary-def">Operations where ALL participants exchange data (all-reduce, broadcast, etc.)</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">All-Reduce</div>
+            <div class="glossary-def">Everyone sends data → combine it → everyone gets the result. The bread & butter of distributed ML.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Peer / Node / Worker</div>
+            <div class="glossary-def">One computer participating in distributed training. Used interchangeably.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">WAN</div>
+            <div class="glossary-def">Wide Area Network - fancy term for "the internet" or connections between datacenters.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Bit-Identical</div>
+            <div class="glossary-def">Exactly the same, down to every 0 and 1. Not "close enough" - EXACTLY the same.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Micro-Consensus</div>
+            <div class="glossary-def">All peers must agree before ANY state change. Like requiring unanimous jury verdict.</div>
+        </div>
+    </aside>
+</body>
+</html>

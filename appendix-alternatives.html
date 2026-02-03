@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Appendix: Alternatives - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html" class="active">A. Alternatives</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Appendix A: Alternatives to PCCL</h1>
+        <p class="subtitle">Know Your Options</p>
+
+        <h2>Comparison Table</h2>
+        <table>
+            <tr>
+                <th>Library</th>
+                <th>Fault Tolerant</th>
+                <th>Dynamic Membership</th>
+                <th>Bit-Identical</th>
+                <th>WAN Optimized</th>
+            </tr>
+            <tr>
+                <td>PCCL</td>
+                <td>✅ Native</td>
+                <td>✅ Runtime</td>
+                <td>✅ Guaranteed</td>
+                <td>✅ ATSP ring</td>
+            </tr>
+            <tr>
+                <td>NCCL</td>
+                <td>❌ None</td>
+                <td>❌ Fixed</td>
+                <td>❌ Non-deterministic</td>
+                <td>❌ Datacenter only</td>
+            </tr>
+            <tr>
+                <td>Gloo</td>
+                <td>❌ None</td>
+                <td>❌ Fixed</td>
+                <td>❌ Non-deterministic</td>
+                <td>⚠️ Basic TCP</td>
+            </tr>
+            <tr>
+                <td>Hivemind</td>
+                <td>✅ DHT-based</td>
+                <td>✅ Fully dynamic</td>
+                <td>❌ Eventual</td>
+                <td>✅ Designed for WAN</td>
+            </tr>
+            <tr>
+                <td>Horovod Elastic</td>
+                <td>⚠️ Checkpoint</td>
+                <td>✅ With restart</td>
+                <td>❌ Non-deterministic</td>
+                <td>❌ Uses NCCL/Gloo</td>
+            </tr>
+        </table>
+
+        <h2>NCCL (NVIDIA Collective Communications Library)</h2>
+
+        <div class="diagram">
+NCCL Architecture:
+─────────────────────────────────────────────────────────────────────────
+
+    GPU 0 ◄══NVLink══► GPU 1 ◄══NVLink══► GPU 2 ◄══NVLink══► GPU 3
+              │                   │                   │
+              └───────────────────┴───────────────────┘
+                        InfiniBand / PCIe
+
+Optimized for: Same machine or datacenter with NVLink/InfiniBand
+        </div>
+
+        <table>
+            <tr><th>Pros</th><th>Cons</th></tr>
+            <tr><td>Fastest for datacenter</td><td>No fault tolerance</td></tr>
+            <tr><td>NVLink/InfiniBand optimized</td><td>Fixed world size</td></tr>
+            <tr><td>NVIDIA-supported</td><td>Non-deterministic reductions</td></tr>
+            <tr><td>Widely adopted</td><td>Crashes kill entire job</td></tr>
+        </table>
+
+        <div class="watch-it">
+            <h3>⚠️ NCCL Non-Determinism</h3>
+            <p>NCCL uses tree-based reductions with non-deterministic ordering. Running the same all-reduce twice can produce different results due to floating-point associativity!</p>
+            <p><code>a + (b + c) ≠ (a + b) + c</code> in floating point.</p>
+        </div>
+
+        <h2>Gloo (Facebook)</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li>CPU-focused collective library</li>
+                <li>Supports TCP, shared memory, InfiniBand</li>
+                <li>Used by PyTorch for CPU training</li>
+                <li>No GPU-direct support (copies through CPU)</li>
+            </ul>
+        </div>
+
+        <table>
+            <tr><th>Pros</th><th>Cons</th></tr>
+            <tr><td>Works on any hardware</td><td>Slower than NCCL for GPU</td></tr>
+            <tr><td>Good for CPU training</td><td>No fault tolerance</td></tr>
+            <tr><td>Open source</td><td>Fixed membership</td></tr>
+        </table>
+
+        <h2>Hivemind</h2>
+
+        <div class="analogy-box">
+            <h3>🐝 The Beehive Analogy</h3>
+            <p>Hivemind is like a beehive - no queen (master), bees come and go freely, and the hive keeps functioning. Great for chaos, but you can't guarantee every bee has the exact same honey recipe!</p>
+        </div>
+
+        <div class="diagram">
+Hivemind Architecture (Fully Decentralized):
+─────────────────────────────────────────────────────────────────────────
+
+                    ┌─────────────────────────────┐
+                    │   DHT (Distributed Hash     │
+                    │        Table)               │
+                    └─────────────────────────────┘
+                           ▲    ▲    ▲
+                           │    │    │
+         ┌─────────────────┼────┼────┼─────────────────┐
+         │                 │    │    │                 │
+         ▼                 ▼    ▼    ▼                 ▼
+    ┌─────────┐       ┌─────────┐       ┌─────────┐
+    │ Peer A  │◄─────►│ Peer B  │◄─────►│ Peer C  │
+    └─────────┘       └─────────┘       └─────────┘
+
+No master! Peers discover each other via DHT.
+        </div>
+
+        <table>
+            <tr><th>Pros</th><th>Cons</th></tr>
+            <tr><td>No single point of failure</td><td>Eventual consistency only</td></tr>
+            <tr><td>Truly decentralized</td><td>Complex failure modes</td></tr>
+            <tr><td>Handles heterogeneous hardware</td><td>Non-deterministic results</td></tr>
+            <tr><td>Good for volunteer computing</td><td>Higher coordination overhead</td></tr>
+        </table>
+
+        <h2>Horovod Elastic</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li>Python-level wrapper around NCCL/Gloo</li>
+                <li>Fault tolerance via checkpointing</li>
+                <li>Workers can join/leave between epochs</li>
+                <li>Requires driver process to coordinate</li>
+            </ul>
+        </div>
+
+        <div class="diagram">
+Horovod Elastic Recovery:
+─────────────────────────────────────────────────────────────────────────
+
+Normal operation:
+    Worker 0 ──► Worker 1 ──► Worker 2 ──► Worker 3
+                    │
+                    ▼ CRASH!
+
+Recovery (slow):
+    1. Detect failure (timeout)           ~30 seconds
+    2. Kill all workers                   ~5 seconds
+    3. Load checkpoint from disk          ~60 seconds
+    4. Restart with new world size        ~30 seconds
+    ─────────────────────────────────────────────────
+    Total recovery time:                  ~2 minutes
+
+PCCL recovery: ~250ms (1000x faster!)
+        </div>
+
+        <h2>When to Use What</h2>
+
+        <div class="remember-this">
+            <h3>💡 Decision Guide</h3>
+            <table>
+                <tr><th>Scenario</th><th>Best Choice</th></tr>
+                <tr><td>Single datacenter, NVIDIA GPUs, stable</td><td>NCCL</td></tr>
+                <tr><td>CPU-only training</td><td>Gloo</td></tr>
+                <tr><td>Volunteer/heterogeneous compute</td><td>Hivemind</td></tr>
+                <tr><td>Cloud spot instances, need reliability</td><td>Horovod Elastic</td></tr>
+                <tr><td>WAN, fault tolerance, bit-identical</td><td><strong>PCCL</strong></td></tr>
+            </table>
+        </div>
+
+        <h2>Why PCCL Was Created</h2>
+
+        <div class="fireside-chat">
+            <div class="chat-message">
+                <span class="chat-speaker">Researcher:</span> "I want to train across multiple datacenters with spot instances."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">NCCL:</span> "I only work in one datacenter with InfiniBand."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Gloo:</span> "I can do WAN, but if one node dies, everything dies."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Hivemind:</span> "I handle failures, but your gradients won't be bit-identical."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Horovod:</span> "I can recover, but it takes 2 minutes and loses progress."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Researcher:</span> "I need ALL of: WAN, fault tolerance, bit-identical, fast recovery."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">Everyone:</span> "..."
+            </div>
+            <div class="chat-message">
+                <span class="chat-speaker">PCCL:</span> "That's why I exist."
+            </div>
+        </div>
+
+        <h2>Migration Guide</h2>
+
+        <h3>From NCCL to PCCL</h3>
+        <div class="code-block">
+<pre><code># Before (NCCL via PyTorch)
+dist.init_process_group(backend='nccl')
+dist.all_reduce(tensor)
+
+# After (PCCL)
+import pccl
+client = pccl.Client(master_addr, master_port)
+client.all_reduce(tensor)  # fault-tolerant!</code></pre>
+        </div>
+
+        <h3>From Hivemind to PCCL</h3>
+        <div class="code-block">
+<pre><code># Before (Hivemind)
+dht = hivemind.DHT(initial_peers=[...])
+optimizer = hivemind.Optimizer(dht, ...)
+
+# After (PCCL) - simpler, deterministic
+client = pccl.Client(master_addr, master_port)
+# Use standard optimizer, PCCL handles sync</code></pre>
+        </div>
+
+        <div class="exercise">
+            <h3>✏️ Choose the Right Tool</h3>
+            <p>For each scenario, which library would you choose?</p>
+            <ol>
+                <li>Training GPT-4 scale model in a single AWS region with p4d instances</li>
+                <li>Distributed training across home GPUs donated by volunteers</li>
+                <li>Training on preemptible GCP instances that can be killed anytime</li>
+                <li>Research requiring reproducible, bit-identical results</li>
+            </ol>
+            <div class="answer-reveal">
+                <strong>Answers:</strong><br>
+                1. NCCL (stable datacenter, maximum performance)<br>
+                2. Hivemind (heterogeneous, unreliable, no central control)<br>
+                3. PCCL (fault tolerance + fast recovery)<br>
+                4. PCCL (only option with bit-identical guarantee)
+            </div>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter10-deployment.html" class="prev">← Deployment</a>
+            <a href="appendix-production.html" class="next">Next: Production Notes →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">NCCL</div>
+            <div class="glossary-def">NVIDIA Collective Communications Library. Fast but datacenter-only.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Gloo</div>
+            <div class="glossary-def">Facebook's collective library. CPU-focused, works anywhere.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Hivemind</div>
+            <div class="glossary-def">Fully decentralized training. No master, eventual consistency.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">DHT</div>
+            <div class="glossary-def">Distributed Hash Table. Decentralized key-value store for peer discovery.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">NVLink</div>
+            <div class="glossary-def">NVIDIA's high-speed GPU interconnect. 600+ GB/s between GPUs.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">InfiniBand</div>
+            <div class="glossary-def">High-speed datacenter network. 200+ Gbps, low latency.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Eventual Consistency</div>
+            <div class="glossary-def">All nodes converge to same state eventually, but not immediately.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Bit-Identical</div>
+            <div class="glossary-def">Exact same bits on all nodes. Stronger than "approximately equal".</div>
+        </div>
+    </aside>
+</body>
+</html>

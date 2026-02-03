@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 0: Prerequisites - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html" class="active">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+
+    <main class="content">
+        <h1>Chapter 0: Prerequisites</h1>
+        <p class="subtitle">Are you ready for this journey?</p>
+
+        <div class="brain-power">
+            <h3>What You Should Already Know</h3>
+            <p>This book assumes you're comfortable with:</p>
+            <ul>
+                <li>Basic programming (Python, or any language really)</li>
+                <li>What a neural network is (layers, weights, training)</li>
+                <li>What a gradient is (direction to update weights)</li>
+            </ul>
+            <p><strong>Don't know these?</strong> That's okay! We'll give you a 5-minute crash course below.</p>
+        </div>
+
+        <h2>🎓 60-Second Crash Courses</h2>
+
+        <h3>Crash Course #1: Neural Network Training</h3>
+        
+        <div class="analogy-box">
+            <h3>Training = Adjusting Knobs</h3>
+            <p>Imagine a massive mixing board with millions of knobs (these are <strong>weights/parameters</strong>). Your goal: adjust knobs until the output sounds perfect.</p>
+            <p><strong>Forward pass:</strong> Play the current settings, hear the output<br>
+            <strong>Loss:</strong> How bad does it sound? (lower = better)<br>
+            <strong>Backward pass:</strong> Figure out which knobs to turn and how much<br>
+            <strong>Gradient:</strong> The "recipe" for knob adjustments<br>
+            <strong>Optimizer step:</strong> Actually turn the knobs</p>
+        </div>
+
+        <pre><code># The training loop in 6 lines
+for batch in data:
+    output = model(batch)           # Forward pass
+    loss = compute_loss(output)     # How wrong are we?
+    loss.backward()                 # Compute gradients
+    optimizer.step()                # Update weights
+    optimizer.zero_grad()           # Reset for next batch</code></pre>
+
+        <h3>Crash Course #2: Why Distributed Training?</h3>
+
+        <div class="no-dumb-questions">
+            <p><strong>Q: Why can't I just train on one GPU?</strong></p>
+            <p>A: Modern models have BILLIONS of parameters. GPT-4 reportedly has ~1.8 trillion. One GPU has maybe 80GB memory. Do the math - it doesn't fit!</p>
+            
+            <p><strong>Q: So I use multiple GPUs. What's the problem?</strong></p>
+            <p>A: Each GPU computes gradients on different data. You need to COMBINE these gradients so everyone updates the same way. That's <strong>collective communication</strong>.</p>
+        </div>
+
+        <h3>Crash Course #3: TCP/IP Basics</h3>
+
+        <div class="analogy-box">
+            <h3>TCP = Reliable Mail Service</h3>
+            <p><strong>IP Address:</strong> Your house address (where to send stuff)<br>
+            <strong>Port:</strong> Which door to knock on (different services use different ports)<br>
+            <strong>TCP:</strong> Guaranteed delivery - if packet lost, resend it<br>
+            <strong>Socket:</strong> The "phone line" between two computers</p>
+        </div>
+
+        <div class="diagram">
+Computer A                          Computer B
+┌─────────────┐                    ┌─────────────┐
+│ Application │                    │ Application │
+│      ↓      │                    │      ↑      │
+│   Socket    │ ←── TCP/IP ──────► │   Socket    │
+│ 192.168.1.1 │    Connection      │ 192.168.1.2 │
+│   :8080     │                    │   :8080     │
+└─────────────┘                    └─────────────┘
+        </div>
+
+        <h2>✅ Self-Assessment Quiz</h2>
+
+        <div class="exercise">
+            <h3>Are you ready? Answer these:</h3>
+            
+            <p><strong>1. What does "gradient" mean in ML?</strong></p>
+            <div class="quiz-option">A) The color scheme of a UI</div>
+            <div class="quiz-option">B) Direction & magnitude to update weights</div>
+            <div class="quiz-option">C) A type of neural network layer</div>
+            
+            <p><strong>2. Why do we need multiple GPUs for large models?</strong></p>
+            <div class="quiz-option">A) One GPU is too slow</div>
+            <div class="quiz-option">B) Model doesn't fit in one GPU's memory</div>
+            <div class="quiz-option">C) Both A and B</div>
+            
+            <p><strong>3. What does TCP guarantee?</strong></p>
+            <div class="quiz-option">A) Fast delivery</div>
+            <div class="quiz-option">B) Reliable delivery (no lost packets)</div>
+            <div class="quiz-option">C) Encrypted delivery</div>
+            
+            <div class="answer-reveal">
+                <strong>Answers:</strong> 1-B, 2-C, 3-B<br>
+                Got 2+ right? You're ready! Got less? Re-read the crash courses above.
+            </div>
+        </div>
+
+        <h2>🔑 Key Concepts You'll See Everywhere</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>World Size:</strong> Total number of peers/GPUs in training</li>
+                <li><strong>Rank:</strong> Each peer's unique ID (0 to world_size-1)</li>
+                <li><strong>All-Reduce:</strong> Combine data from all peers, give result to all</li>
+                <li><strong>Tensor:</strong> Multi-dimensional array (fancy word for "matrix")</li>
+                <li><strong>Epoch:</strong> One complete pass through all training data</li>
+                <li><strong>Batch:</strong> Subset of data processed at once</li>
+            </ul>
+        </div>
+
+        <h2>🧮 Math You'll Need</h2>
+
+        <p>Don't worry - it's just basic arithmetic!</p>
+
+        <div class="remember-this">
+            <h3>The Only Formula That Matters</h3>
+            <p style="font-size: 1.2rem; text-align: center;">
+                <code>new_weights = old_weights - learning_rate × gradient</code>
+            </p>
+            <p>That's it. Everything else is just making this happen across multiple computers efficiently.</p>
+        </div>
+
+        <h2>🛠️ Tools to Have Ready</h2>
+
+        <table>
+            <tr>
+                <th>Tool</th>
+                <th>Why</th>
+                <th>Install</th>
+            </tr>
+            <tr>
+                <td>Python 3.8+</td>
+                <td>Code examples</td>
+                <td><code>brew install python</code></td>
+            </tr>
+            <tr>
+                <td>PyTorch</td>
+                <td>ML framework</td>
+                <td><code>pip install torch</code></td>
+            </tr>
+            <tr>
+                <td>Rust (optional)</td>
+                <td>Build your own PCCL</td>
+                <td><code>curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh</code></td>
+            </tr>
+        </table>
+
+        <div class="trivia">
+            <p><strong>Fun Fact:</strong> The name "tensor" comes from Latin "tendere" (to stretch). Tensors were originally used in physics to describe stress and strain in materials. Now they're the backbone of AI!</p>
+        </div>
+
+        <div class="mnemonic">
+            <p class="mnemonic-text">"FROG" = Forward, Reduce, Optimize, Gradient-zero</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">The 4 steps of distributed training: Forward pass → Reduce gradients → Optimizer step → Gradient zero</p>
+        </div>
+
+        <div class="navigation">
+            <a href="index.html" class="prev">← Home</a>
+            <a href="chapter1-introduction.html" class="next">Next: The Problem →</a>
+        </div>
+    </main>
+
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Gradient</div>
+            <div class="glossary-def">Vector pointing in direction of steepest increase of loss. We go OPPOSITE direction to minimize.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Parameters / Weights</div>
+            <div class="glossary-def">The learnable numbers in a neural network. What training actually changes.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Loss Function</div>
+            <div class="glossary-def">Measures how wrong the model is. Lower = better. Training minimizes this.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Optimizer</div>
+            <div class="glossary-def">Algorithm that updates weights using gradients. Examples: SGD, Adam, AdamW.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Forward Pass</div>
+            <div class="glossary-def">Running input through the network to get output. The "prediction" step.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Backward Pass</div>
+            <div class="glossary-def">Computing gradients by going backwards through the network. Uses chain rule.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">TCP/IP</div>
+            <div class="glossary-def">The protocol that runs the internet. TCP = reliable delivery, IP = addressing.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Socket</div>
+            <div class="glossary-def">Endpoint for network communication. Like a phone - you need one on each end to talk.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Latency</div>
+            <div class="glossary-def">Time delay for data to travel. High latency = slow response. Measured in milliseconds.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Bandwidth</div>
+            <div class="glossary-def">How much data can flow per second. Like pipe diameter - bigger = more water.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Tensor</div>
+            <div class="glossary-def">N-dimensional array. 1D = vector, 2D = matrix, 3D+ = tensor. The data structure of ML.</div>
+        </div>
+    </aside>
+</body>
+</html>

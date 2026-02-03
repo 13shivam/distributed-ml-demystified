@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 8: Benchmarks - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html" class="active">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+            <li><a href="appendix-production.html">B. Production Notes</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Chapter 8: Benchmarks</h1>
+        <p class="subtitle">Real Numbers from the PCCL Paper</p>
+
+        <div class="watch-it" style="background: #fff3cd; border-left: 4px solid #ffc107; padding: 1rem; margin: 1rem 0;">
+            <h3>⚠️ DISCLAIMER</h3>
+            <p><strong>All benchmark numbers in this chapter are from the original PCCL paper (arXiv:2505.14065).</strong></p>
+            <p>Results depend heavily on: network topology, cloud provider, time of day, congestion, and hardware. Your mileage WILL vary. These are reference points, not guarantees.</p>
+        </div>
+
+        <h2>The Critical Insight: Multiple Connections</h2>
+
+        <div class="watch-it" style="background: #f8d7da; border-left: 4px solid #dc3545;">
+            <h3>🔴 THIS IS THE MOST IMPORTANT SECTION</h3>
+            <p>Single TCP connection over WAN is SLOW. The paper's key finding:</p>
+            <ul>
+                <li><strong>1 connection:</strong> ~3.6 Gbit/s (Europe West)</li>
+                <li><strong>64 connections:</strong> ~45 Gbit/s (Europe West)</li>
+            </ul>
+            <p><strong>12x improvement!</strong> If you deploy PCCL with single connections, you're leaving 90% of bandwidth on the table.</p>
+        </div>
+
+        <h3>Why Multiple Connections Matter</h3>
+
+        <p>From the paper (Section 6.2):</p>
+        <div class="bullet-points">
+            <ul>
+                <li><strong>TCP receive-window auto-scaling</strong> rarely reaches peak on high-latency WAN links</li>
+                <li><strong>Per-flow fair-queuing</strong> in routers means more flows = more bandwidth slices</li>
+                <li><strong>Multiple concurrent all-reduces</strong> can dispatch to connection pool</li>
+            </ul>
+        </div>
+
+        <div class="diagram">
+Bandwidth vs Connection Count (Europe West, from paper):
+─────────────────────────────────────────────────────────────────────────
+
+Connections    Bandwidth (Gbit/s)
+────────────   ──────────────────
+8              11.25
+16             18.17
+32             34.29
+64             44.47
+100            44.55
+128            45.74
+
+Plateau at ~64 connections. Beyond that, diminishing returns.
+        </div>
+
+        <h2>Actual Benchmark Results (From Paper)</h2>
+
+        <h3>Experiment 1: Europe West (6 nodes)</h3>
+
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>World Size</td><td>6 peers</td></tr>
+            <tr><td>Reduce Contribution</td><td>1.073 GB</td></tr>
+            <tr><td>Reduce Time (single conn)</td><td>8.3s ± 0.33s</td></tr>
+            <tr><td>Effective Throughput</td><td>129.2 MB/s</td></tr>
+            <tr><td>Bandwidth Utilization</td><td>3.67 Gbit/s</td></tr>
+        </table>
+
+        <p>Locations: Frankfurt, Paris, Belgium, London, Netherlands</p>
+
+        <h3>Experiment 2: North America (12 nodes)</h3>
+
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>World Size</td><td>12 peers</td></tr>
+            <tr><td>Reduce Contribution</td><td>1.073 GB</td></tr>
+            <tr><td>Reduce Time (single conn)</td><td>35.2s ± 0.31s</td></tr>
+            <tr><td>Effective Throughput</td><td>30.48 MB/s</td></tr>
+            <tr><td>Bandwidth Utilization</td><td>897.6 Mbit/s</td></tr>
+        </table>
+
+        <p>Locations: Oregon, Texas, South Carolina, Iowa, Montreal, Toronto, Virginia</p>
+
+        <h3>Experiment 3: North America + Europe (18 nodes)</h3>
+
+        <div class="watch-it">
+            <h3>⚠️ Cross-Continental is SLOW</h3>
+            <p>The undersea cable is the bottleneck. No amount of software optimization fixes physics.</p>
+        </div>
+
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>World Size</td><td>18 peers</td></tr>
+            <tr><td>Reduce Contribution</td><td>1.073 GB</td></tr>
+            <tr><td>Reduce Time (single conn)</td><td>90.5s ± 0.35s</td></tr>
+            <tr><td>Effective Throughput</td><td>11.85 MB/s</td></tr>
+            <tr><td>Bandwidth Utilization</td><td>358.4 Mbit/s</td></tr>
+        </table>
+
+        <h2>With Concurrent Connections</h2>
+
+        <h3>Europe West (64 concurrent connections)</h3>
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Time</td><td>2.6s ± 0.23s</td></tr>
+            <tr><td>Effective Throughput</td><td>1.655 GB/s</td></tr>
+            <tr><td>Bandwidth</td><td>44.47 Gbit/s</td></tr>
+        </table>
+
+        <h3>North America (64 concurrent connections)</h3>
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Time</td><td>4.9s ± 0.60s</td></tr>
+            <tr><td>Effective Throughput</td><td>0.878 GB/s</td></tr>
+            <tr><td>Bandwidth</td><td>26.08 Gbit/s</td></tr>
+        </table>
+
+        <h2>PCCL vs Gloo Comparison</h2>
+
+        <div class="remember-this">
+            <h3>💡 Honest Assessment</h3>
+            <p>The paper states PCCL is <strong>"competitive with Gloo"</strong> in HPC benchmarks, not dramatically superior. The advantage is fault tolerance and topology optimization, not raw speed.</p>
+        </div>
+
+        <table>
+            <tr>
+                <th>Experiment</th>
+                <th>PCCL Time</th>
+                <th>Gloo Time</th>
+                <th>Improvement</th>
+            </tr>
+            <tr>
+                <td>NA + Europe (18 nodes)</td>
+                <td>90.5s ± 0.35s</td>
+                <td>94.4s ± 1.84s</td>
+                <td>4.15%</td>
+            </tr>
+            <tr>
+                <td>North America (12 nodes)</td>
+                <td>35.2s ± 0.31s</td>
+                <td>37.6s ± 0.85s</td>
+                <td>6.33%</td>
+            </tr>
+            <tr>
+                <td>Europe West (6 nodes)</td>
+                <td>8.3s ± 0.33s</td>
+                <td>9.67s ± 0.77s</td>
+                <td>14.17%</td>
+            </tr>
+        </table>
+
+        <p><strong>Key insight:</strong> PCCL's advantage comes from ATSP topology optimization. Gloo uses naive rank order = suboptimal ring.</p>
+
+        <div class="watch-it">
+            <h3>⚠️ Gloo Cannot Do Concurrent All-Reduces</h3>
+            <p>Gloo doesn't natively support concurrent all-reduce operations. This means it <strong>cannot exploit the multiple-connection trick</strong> that gives PCCL its biggest WAN advantage.</p>
+        </div>
+
+        <h2>HPC Benchmark (Datacenter)</h2>
+
+        <div class="diagram">
+HPC Reduce Throughput (35.6 Gbit/s Ethernet, 1.073 GB per peer):
+─────────────────────────────────────────────────────────────────────────
+
+World Size    PCCL (MB/s)    Gloo (MB/s)
+──────────    ───────────    ───────────
+2             ~1800          ~1900
+4             ~1600          ~1700
+8             ~1400          ~1500
+
+Note: PCCL is slightly SLOWER in pure HPC due to abort-checking overhead
+(futex syscalls). The paper acknowledges this tradeoff.
+        </div>
+
+        <div class="remember-this">
+            <h3>💡 The Real Tradeoff</h3>
+            <p>PCCL sacrifices ~5-10% raw HPC performance for:</p>
+            <ul>
+                <li>Fault tolerance (abort mid-operation)</li>
+                <li>Dynamic membership</li>
+                <li>Bit-identical guarantees</li>
+            </ul>
+            <p>If you're in a stable datacenter with InfiniBand, use NCCL. PCCL is for unreliable WAN.</p>
+        </div>
+
+        <h2>Stress Testing</h2>
+
+        <table>
+            <tr><th>Parameter</th><th>Value</th></tr>
+            <tr><td>Duration</td><td>~8 hours per run</td></tr>
+            <tr><td>Peer churn interval</td><td>500-1000ms (random)</td></tr>
+            <tr><td>Iteration time</td><td>~100ms</td></tr>
+            <tr><td>Platforms tested</td><td>Linux, macOS, Windows</td></tr>
+            <tr><td>Pass criteria</td><td>Shared state advances correctly despite churn</td></tr>
+        </table>
+
+        <h2>SimpleHash Performance</h2>
+
+        <div class="diagram">
+SimpleHash vs Thrust Reduce (RTX 4090):
+─────────────────────────────────────────────────────────────────────────
+
+Data Size    SimpleHash (GB/s)    Thrust (GB/s)    Theoretical Max
+─────────    ─────────────────    ─────────────    ───────────────
+16 MB        ~400                 ~350             1008.1 GB/s
+64 MB        ~700                 ~650
+256 MB       ~850                 ~800
+1024 MB      ~900                 ~850
+
+SimpleHash achieves ~90% of theoretical memory bandwidth.
+        </div>
+
+        <div class="navigation">
+            <a href="chapter7-implementation.html" class="prev">← Implementation</a>
+            <a href="chapter9-build-your-own.html" class="next">Next: Build Your Own →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">Effective Throughput</div>
+            <div class="glossary-def">Reduce contribution size / time. Implementation-agnostic metric.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Bandwidth Utilization</div>
+            <div class="glossary-def">TX+RX bytes per second. Actual network usage.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Connection Pool</div>
+            <div class="glossary-def">Multiple TCP connections per peer pair. Essential for WAN performance.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Per-Flow Fair Queuing</div>
+            <div class="glossary-def">Routers allocate bandwidth per TCP flow. More flows = more bandwidth.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Undersea Cable</div>
+            <div class="glossary-def">Physical bottleneck for cross-continental traffic. ~100ms RTT minimum.</div>
+        </div>
+    </aside>
+</body>
+</html>
