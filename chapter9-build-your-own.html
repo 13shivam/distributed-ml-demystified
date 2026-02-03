@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 9: Build Your Own - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html" class="active">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Chapter 9: Build Your Own</h1>
+        <p class="subtitle">HLD, LLD, Class Diagrams & Implementation Roadmap</p>
+
+        <h2>High-Level Design (HLD)</h2>
+        
+        <div class="remember-this">
+            <h3>💡 System Overview</h3>
+            <p>PCCL consists of 3 main components communicating over TCP/IP:</p>
+            <ul>
+                <li><strong>Master Server</strong> - Coordination & consensus</li>
+                <li><strong>Peer Client</strong> - Training & collective operations</li>
+                <li><strong>P2P Mesh</strong> - Direct data transfer between peers</li>
+            </ul>
+        </div>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        HIGH-LEVEL ARCHITECTURE                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                           ┌─────────────────┐
+                           │  MASTER SERVER  │
+                           │                 │
+                           │ • Membership    │
+                           │ • Consensus     │
+                           │ • Topology      │
+                           └────────┬────────┘
+                                    │
+                    Control Plane   │   (lightweight messages)
+                    ────────────────┼────────────────
+                                    │
+         ┌──────────────────────────┼──────────────────────────┐
+         │                          │                          │
+         ▼                          ▼                          ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│   PEER CLIENT   │      │   PEER CLIENT   │      │   PEER CLIENT   │
+│                 │      │                 │      │                 │
+│ • Model/Grads   │◄────►│ • Model/Grads   │◄────►│ • Model/Grads   │
+│ • Optimizer     │      │ • Optimizer     │      │ • Optimizer     │
+│ • Collectives   │      │ • Collectives   │      │ • Collectives   │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+         ▲                          ▲                          ▲
+         │                          │                          │
+         └──────────────────────────┴──────────────────────────┘
+                           Data Plane (P2P Mesh)
+                           (heavy tensor data)
+        </div>
+
+        <h3>Component Responsibilities</h3>
+        <table>
+            <tr><th>Component</th><th>Responsibilities</th><th>Communicates With</th></tr>
+            <tr>
+                <td>Master Server</td>
+                <td>Track peers, coordinate state transitions, optimize topology</td>
+                <td>All Peers (control)</td>
+            </tr>
+            <tr>
+                <td>Peer Client</td>
+                <td>Hold model weights, run training, execute collectives</td>
+                <td>Master + Other Peers</td>
+            </tr>
+            <tr>
+                <td>P2P Connection</td>
+                <td>Transfer tensor data directly between peers</td>
+                <td>Peer ↔ Peer only</td>
+            </tr>
+        </table>
+
+        <h2>Entity Relationship Diagram</h2>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      ENTITY RELATIONSHIP DIAGRAM                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────┐       1:N        ┌──────────────┐
+│    Master    │─────────────────►│     Peer     │
+│──────────────│                  │──────────────│
+│ id           │                  │ id (rank)    │
+│ address      │                  │ address      │
+│ port         │                  │ port         │
+│ topology     │                  │ phase        │
+└──────────────┘                  │ state        │
+                                  │ hash         │
+                                  └──────┬───────┘
+                                         │
+                                         │ N:N
+                                         ▼
+                                  ┌──────────────┐
+                                  │ P2PConnection│
+                                  │──────────────│
+                                  │ peer_a_id    │
+                                  │ peer_b_id    │
+                                  │ bandwidth    │
+                                  │ latency      │
+                                  │ socket       │
+                                  └──────────────┘
+                                         │
+                                         │ 1:N
+                                         ▼
+┌──────────────┐       N:1        ┌──────────────┐
+│  Operation   │◄─────────────────│    Tensor    │
+│──────────────│                  │──────────────│
+│ id (tag)     │                  │ id           │
+│ type         │                  │ data_ptr     │
+│ state        │                  │ size         │
+│ participants │                  │ dtype        │
+└──────────────┘                  │ device       │
+                                  └──────────────┘
+        </div>
+
+        <h2>Low-Level Design (LLD)</h2>
+
+        <h3>Phase 1: Core Infrastructure</h3>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 1: CLASS DIAGRAM - CORE                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────┐
+│           TcpServer             │
+├─────────────────────────────────┤
+│ - address: String               │
+│ - port: u16                     │
+│ - listener: TcpListener         │
+│ - connections: Vec<TcpStream>   │
+├─────────────────────────────────┤
+│ + bind(addr, port)              │
+│ + accept() -> Connection        │
+│ + broadcast(msg)                │
+│ + shutdown()                    │
+└─────────────────────────────────┘
+              ▲
+              │ uses
+              │
+┌─────────────────────────────────┐      ┌─────────────────────────────────┐
+│           Master                │      │         Peer                    │
+├─────────────────────────────────┤      ├─────────────────────────────────┤
+│ - peers: HashMap<PeerId, Peer>  │      │ - id: PeerId                    │
+│ - topology: RingTopology        │      │ - phase: ConnectionPhase        │
+│ - state: MasterState            │      │ - state: ConnectionState        │
+├─────────────────────────────────┤      │ - master_conn: TcpStream        │
+│ + register_peer(peer)           │      │ - p2p_conns: Vec<P2PConnection> │
+│ + accept_peer(peer_id)          │      ├─────────────────────────────────┤
+│ + remove_peer(peer_id)          │      │ + connect_master(addr)          │
+│ + broadcast_abort(op_id)        │      │ + connect_peer(peer_id)         │
+│ + optimize_topology()           │      │ + send_to_master(msg)           │
+│ + get_ring_order() -> Vec       │      │ + recv_from_master() -> Msg     │
+└─────────────────────────────────┘      └─────────────────────────────────┘
+                                                       │
+                                                       │ has
+                                                       ▼
+                                         ┌─────────────────────────────────┐
+                                         │       P2PConnection             │
+                                         ├─────────────────────────────────┤
+                                         │ - remote_peer_id: PeerId        │
+                                         │ - socket: TcpStream             │
+                                         │ - send_buffer: Vec<u8>          │
+                                         │ - recv_buffer: Vec<u8>          │
+                                         │ - bandwidth: f64                │
+                                         ├─────────────────────────────────┤
+                                         │ + send(data: &[u8])             │
+                                         │ + recv(buf: &mut [u8])          │
+                                         │ + measure_bandwidth() -> f64    │
+                                         │ + close()                       │
+                                         └─────────────────────────────────┘
+        </div>
+
+        <h3>State Machine Classes</h3>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    STATE ENUMS & TRANSITIONS                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
+│  ConnectionPhase    │     │  ConnectionState    │     │  CollectiveState    │
+├─────────────────────┤     ├─────────────────────┤     ├─────────────────────┤
+│ • Registered        │     │ • Idle              │     │ • VoteInitiate      │
+│ • Accepted          │     │ • VotingAcceptPeers │     │ • Performing        │
+└─────────────────────┘     │ • SyncingState      │     │ • VoteComplete      │
+                            │ • CollectiveRunning │     └─────────────────────┘
+                            └─────────────────────┘
+
+State Transition Rules:
+─────────────────────────────────────────────────────────────────────────────
+Registered ──[vote passes]──► Accepted
+
+Idle ──[peers pending]──► VotingAcceptPeers ──[vote done]──► Idle
+Idle ──[hash mismatch]──► SyncingState ──[sync done]──► Idle
+Idle ──[start collective]──► CollectiveRunning ──[complete]──► Idle
+
+VoteInitiate ──[all agree]──► Performing ──[done]──► VoteComplete ──[all ack]──► (end)
+        </div>
+
+        <h3>Phase 2: Collective Operations</h3>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 PHASE 2: CLASS DIAGRAM - COLLECTIVES                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                         ┌─────────────────────────────────┐
+                         │      CollectiveOperation        │ (abstract)
+                         ├─────────────────────────────────┤
+                         │ - tag: u32                      │
+                         │ - state: CollectiveState        │
+                         │ - participants: Vec<PeerId>     │
+                         │ - buffer_backup: Option<Vec>    │
+                         ├─────────────────────────────────┤
+                         │ + execute() -> Result           │
+                         │ + abort()                       │
+                         │ + restore_backup()              │
+                         └───────────────┬─────────────────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+                    ▼                    ▼                    ▼
+┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐
+│      AllReduce        │  │      Broadcast        │  │      AllGather        │
+├───────────────────────┤  ├───────────────────────┤  ├───────────────────────┤
+│ - reduce_op: ReduceOp │  │ - root: PeerId        │  │ - recv_counts: Vec    │
+├───────────────────────┤  ├───────────────────────┤  ├───────────────────────┤
+│ + reduce_scatter()    │  │ + execute()           │  │ + execute()           │
+│ + all_gather()        │  └───────────────────────┘  └───────────────────────┘
+│ + execute()           │
+└───────────────────────┘
+
+┌─────────────────────────────────┐     ┌─────────────────────────────────┐
+│          ReduceOp               │     │        RingTopology             │
+├─────────────────────────────────┤     ├─────────────────────────────────┤
+│ • Sum                           │     │ - order: Vec<PeerId>            │
+│ • Avg                           │     │ - bandwidth_matrix: Matrix      │
+│ • Min                           │     ├─────────────────────────────────┤
+│ • Max                           │     │ + get_next(peer) -> PeerId      │
+└─────────────────────────────────┘     │ + get_prev(peer) -> PeerId      │
+                                        │ + optimize() -> Vec<PeerId>     │
+                                        │ + compute_chunk_bounds(n) -> Vec│
+                                        └─────────────────────────────────┘
+        </div>
+
+        <h3>Phase 3: Fault Tolerance</h3>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│               PHASE 3: CLASS DIAGRAM - FAULT TOLERANCE                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────┐
+│        FailureDetector          │
+├─────────────────────────────────┤
+│ - heartbeat_interval: Duration  │
+│ - timeout: Duration             │
+│ - last_seen: HashMap<PeerId, T> │
+├─────────────────────────────────┤
+│ + start_monitoring()            │
+│ + record_heartbeat(peer_id)     │
+│ + get_failed_peers() -> Vec     │
+│ + is_alive(peer_id) -> bool     │
+└─────────────────────────────────┘
+
+┌─────────────────────────────────┐     ┌─────────────────────────────────┐
+│        AbortController          │     │       StateRecovery             │
+├─────────────────────────────────┤     ├─────────────────────────────────┤
+│ - abort_flag: AtomicBool        │     │ - backup_store: HashMap         │
+│ - abort_reason: Option<Error>   │     ├─────────────────────────────────┤
+├─────────────────────────────────┤     │ + save_backup(op_id, data)      │
+│ + signal_abort(reason)          │     │ + restore_backup(op_id) -> Data │
+│ + check_abort() -> bool         │     │ + clear_backup(op_id)           │
+│ + reset()                       │     │ + has_backup(op_id) -> bool     │
+└─────────────────────────────────┘     └─────────────────────────────────┘
+
+┌─────────────────────────────────┐
+│        SharedStateSync          │
+├─────────────────────────────────┤
+│ - hasher: SimpleHash            │
+│ - local_hash: u64               │
+├─────────────────────────────────┤
+│ + compute_hash(tensors) -> u64  │
+│ + compare_hashes(peers) -> Vec  │  (returns outliers)
+│ + sync_from_peer(peer_id)       │
+│ + sync_to_peer(peer_id)         │
+└─────────────────────────────────┘
+        </div>
+
+        <h2>Sequence Diagrams</h2>
+
+        <h3>Peer Join Flow</h3>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SEQUENCE: PEER JOIN                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  NewPeer              Master              ExistingPeers
+     │                    │                      │
+     │──── connect() ────►│                      │
+     │                    │                      │
+     │◄─── REGISTERED ────│                      │
+     │                    │                      │
+     │                    │◄── vote_accept? ─────│
+     │                    │                      │
+     │                    │──── vote_accept ────►│
+     │                    │                      │
+     │                    │◄─── all_agree ───────│
+     │                    │                      │
+     │◄─── ACCEPTED ──────│                      │
+     │                    │                      │
+     │◄─────────────── establish P2P ───────────►│
+     │                    │                      │
+     │                    │◄── sync_state ───────│
+     │◄──────────── receive state ──────────────│
+     │                    │                      │
+     │                READY TO PARTICIPATE       │
+     ▼                    ▼                      ▼
+        </div>
+
+        <h3>All-Reduce Flow</h3>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SEQUENCE: ALL-REDUCE                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  Peer0           Peer1           Peer2           Master
+    │               │               │               │
+    │───────────── vote_initiate ──────────────────►│
+    │               │               │               │
+    │◄──────────── all_agreed ─────────────────────│
+    │               │               │               │
+    │ backup_buffer │ backup_buffer │ backup_buffer │
+    │               │               │               │
+    │ ══════════ REDUCE-SCATTER (N-1 steps) ══════ │
+    │               │               │               │
+    │──── chunk ───►│               │               │
+    │               │──── chunk ───►│               │
+    │◄───────────── chunk ─────────│               │
+    │               │               │               │
+    │   (accumulate received chunks locally)       │
+    │               │               │               │
+    │ ══════════ ALL-GATHER (N-1 steps) ═══════════│
+    │               │               │               │
+    │──── chunk ───►│               │               │
+    │               │──── chunk ───►│               │
+    │◄───────────── chunk ─────────│               │
+    │               │               │               │
+    │───────────── vote_complete ──────────────────►│
+    │               │               │               │
+    │◄──────────── all_acked ──────────────────────│
+    │               │               │               │
+    │ clear_backup  │ clear_backup  │ clear_backup  │
+    ▼               ▼               ▼               ▼
+        </div>
+
+        <h3>Failure Recovery Flow</h3>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SEQUENCE: FAILURE DURING COLLECTIVE                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  Peer0           Peer1(dies)      Peer2           Master
+    │               │               │               │
+    │ ══════════ ALL-REDUCE IN PROGRESS ══════════ │
+    │               │               │               │
+    │──── chunk ───►│ CRASH! 💀     │               │
+    │               X               │               │
+    │               X               │               │
+    │   (timeout waiting for Peer1)                │
+    │               │               │               │
+    │────────────── report_failure ────────────────►│
+    │               │               │               │
+    │◄───────────── ABORT signal ──────────────────│
+    │               │               │◄───── ABORT ──│
+    │               │               │               │
+    │ restore_backup│               │ restore_backup│
+    │               │               │               │
+    │               │               │◄─ remove_peer─│
+    │◄──────────── topology_update ────────────────│
+    │               │               │               │
+    │ ══════════ RETRY ALL-REDUCE (2 peers) ══════ │
+    │               │               │               │
+    │◄─────────────────────────────►│               │
+    │               │               │               │
+    │            SUCCESS!           │               │
+    ▼                               ▼               ▼
+        </div>
+
+        <h2>Language Showdown</h2>
+        
+        <div class="fireside-chat">
+            <div class="chat-message"><span class="chat-speaker">Rust:</span> "Memory safety WITHOUT garbage collection. I'm the future!"</div>
+            <div class="chat-message"><span class="chat-speaker">C++:</span> "I'm what PCCL actually uses. Maximum control."</div>
+            <div class="chat-message"><span class="chat-speaker">Go:</span> "Great for the master node! Goroutines are perfect for coordination."</div>
+            <div class="chat-message"><span class="chat-speaker">Python:</span> "I'm just here for the bindings. Let the grown-ups do the real work."</div>
+        </div>
+
+        <h2>Recommended Stack</h2>
+        <table>
+            <tr><th>Component</th><th>Language</th><th>Why</th></tr>
+            <tr><td>Core Library</td><td>Rust or C++</td><td>Performance, memory control</td></tr>
+            <tr><td>Master Node</td><td>Go or Rust</td><td>Concurrency, simplicity</td></tr>
+            <tr><td>Python Bindings</td><td>PyO3 / pybind11</td><td>PyTorch integration</td></tr>
+        </table>
+
+        <h2>Implementation Checklist</h2>
+        <div class="bullet-points">
+            <h3>Phase 1: Core Infrastructure</h3>
+            <ul>
+                <li>☐ TcpServer / TcpClient classes</li>
+                <li>☐ Master with peer registry</li>
+                <li>☐ Peer with master connection</li>
+                <li>☐ P2PConnection class</li>
+                <li>☐ ConnectionPhase enum</li>
+                <li>☐ ConnectionState enum</li>
+                <li>☐ Message serialization (protobuf/msgpack)</li>
+            </ul>
+            <h3>Phase 2: Collective Operations</h3>
+            <ul>
+                <li>☐ RingTopology class</li>
+                <li>☐ CollectiveOperation base class</li>
+                <li>☐ AllReduce (reduce-scatter + all-gather)</li>
+                <li>☐ ReduceOp enum (Sum, Avg, Min, Max)</li>
+                <li>☐ CollectiveState enum</li>
+                <li>☐ Async operation support</li>
+                <li>☐ Multiple concurrent operations</li>
+            </ul>
+            <h3>Phase 3: Fault Tolerance</h3>
+            <ul>
+                <li>☐ FailureDetector (heartbeat-based)</li>
+                <li>☐ AbortController (atomic flag)</li>
+                <li>☐ StateRecovery (backup/restore)</li>
+                <li>☐ SharedStateSync (hash comparison)</li>
+                <li>☐ SimpleHash implementation</li>
+                <li>☐ Graceful peer removal</li>
+                <li>☐ Operation retry logic</li>
+            </ul>
+            <h3>Phase 4: Optimization</h3>
+            <ul>
+                <li>☐ Bandwidth measurement</li>
+                <li>☐ ATSP solver for ring order</li>
+                <li>☐ Connection pooling</li>
+                <li>☐ Quantization support</li>
+            </ul>
+            <h3>Phase 5: Integration</h3>
+            <ul>
+                <li>☐ Python bindings (PyO3/pybind11)</li>
+                <li>☐ PyTorch tensor support</li>
+                <li>☐ CUDA memory handling</li>
+                <li>☐ Stress testing</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter8-benchmarks.html" class="prev">← Benchmarks</a>
+            <a href="chapter10-deployment.html" class="next">Next: Deployment →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">HLD</div>
+            <div class="glossary-def">High-Level Design. Bird's eye view of system components and their interactions.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">LLD</div>
+            <div class="glossary-def">Low-Level Design. Detailed class structures, methods, and data types.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">ERD</div>
+            <div class="glossary-def">Entity Relationship Diagram. Shows data entities and their relationships.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Sequence Diagram</div>
+            <div class="glossary-def">Shows message flow between components over time.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Control Plane</div>
+            <div class="glossary-def">Lightweight coordination messages (Master ↔ Peers).</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Data Plane</div>
+            <div class="glossary-def">Heavy tensor data transfer (Peer ↔ Peer).</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">PyO3</div>
+            <div class="glossary-def">Rust library for Python bindings. Fast and safe!</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">pybind11</div>
+            <div class="glossary-def">C++ library for Python bindings. Industry standard.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">ATSP</div>
+            <div class="glossary-def">Asymmetric Traveling Salesman Problem. Used for ring optimization.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Protobuf</div>
+            <div class="glossary-def">Protocol Buffers. Google's binary serialization format.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">AtomicBool</div>
+            <div class="glossary-def">Thread-safe boolean. Used for abort flags without locks.</div>
+        </div>
+    </aside>
+</body>
+</html>

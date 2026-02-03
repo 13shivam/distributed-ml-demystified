@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 4: Ring All-Reduce - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html" class="active">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+
+    <main class="content">
+        <h1>Chapter 4: Ring All-Reduce</h1>
+        <p class="subtitle">The Algorithm That Powers Distributed Training</p>
+
+        <div class="analogy-box">
+            <h3>🍕 The Pizza Party Analogy</h3>
+            <p>4 friends each made a different pizza. Goal: everyone tastes ALL pizzas.</p>
+            
+            <p><strong>Naive approach:</strong> Everyone sends their whole pizza to everyone else.<br>
+            = 4 × 3 = 12 pizza transfers. Expensive!</p>
+            
+            <p><strong>Ring approach:</strong> Sit in a circle. Pass ONE SLICE to your right neighbor.<br>
+            After 3 rounds, everyone has tasted all pizzas!<br>
+            = 4 × 3 = 12 slice transfers, but slices are SMALLER than whole pizzas!</p>
+        </div>
+
+        <h2>Why Ring All-Reduce?</h2>
+
+        <div class="no-dumb-questions">
+            <p><strong>Q: Why not just send everything to one node, combine, and broadcast back?</strong></p>
+            <p>A: That's called "parameter server" - the central node becomes a bottleneck. With 100 GPUs sending 1GB each, that's 100GB hitting one poor server!</p>
+            
+            <p><strong>Q: Why a ring specifically?</strong></p>
+            <p>A: Ring is bandwidth-optimal! Each node sends exactly 2×(N-1)/N of the data, regardless of world size. Trees and stars don't scale as well.</p>
+        </div>
+
+        <h2>The Two Phases</h2>
+
+        <div class="remember-this">
+            <h3>💡 Ring All-Reduce = Reduce-Scatter + All-Gather</h3>
+            <p><strong>Phase 1 (Reduce-Scatter):</strong> Combine data, each peer ends up "owning" one chunk<br>
+            <strong>Phase 2 (All-Gather):</strong> Share owned chunks so everyone has the full result</p>
+        </div>
+
+        <h2>Phase 1: Reduce-Scatter</h2>
+
+        <div class="diagram">
+Setup: 4 peers, each with data [A, B, C, D] (4 chunks)
+
+Initial State:
+Peer 0: [A₀, B₀, C₀, D₀]    Peer 1: [A₁, B₁, C₁, D₁]
+Peer 2: [A₂, B₂, C₂, D₂]    Peer 3: [A₃, B₃, C₃, D₃]
+
+Ring: 0 → 1 → 2 → 3 → 0
+
+Step 1: Each peer sends chunk[rank] to next, receives from prev
+────────────────────────────────────────────────────────────
+Peer 0: sends D₀ to Peer 1, receives C₃ from Peer 3
+        C₀ + C₃ = C₀₃
+Peer 1: sends A₁ to Peer 2, receives D₀ from Peer 0
+        D₁ + D₀ = D₀₁
+Peer 2: sends B₂ to Peer 3, receives A₁ from Peer 1
+        A₂ + A₁ = A₁₂
+Peer 3: sends C₃ to Peer 0, receives B₂ from Peer 2
+        B₃ + B₂ = B₂₃
+
+Step 2: Continue with accumulated chunks
+────────────────────────────────────────────────────────────
+Peer 0: sends C₀₃ to Peer 1, receives B₂₃ from Peer 3
+        B₀ + B₂₃ = B₀₂₃
+Peer 1: sends D₀₁ to Peer 2, receives C₀₃ from Peer 0
+        C₁ + C₀₃ = C₀₁₃
+...and so on
+
+After N-1 steps:
+Peer 0 owns: A₀₁₂₃ (fully reduced!)
+Peer 1 owns: B₀₁₂₃ (fully reduced!)
+Peer 2 owns: C₀₁₂₃ (fully reduced!)
+Peer 3 owns: D₀₁₂₃ (fully reduced!)
+        </div>
+
+        <h2>Phase 2: All-Gather</h2>
+
+        <div class="diagram">
+After Reduce-Scatter:
+Peer 0: [A*, ?, ?, ?]    Peer 1: [?, B*, ?, ?]
+Peer 2: [?, ?, C*, ?]    Peer 3: [?, ?, ?, D*]
+
+(* = fully reduced)
+
+Step 1: Each peer sends their owned chunk
+────────────────────────────────────────────────────────────
+Peer 0: sends A* to Peer 1, receives D* from Peer 3
+Peer 1: sends B* to Peer 2, receives A* from Peer 0
+Peer 2: sends C* to Peer 3, receives B* from Peer 1
+Peer 3: sends D* to Peer 0, receives C* from Peer 2
+
+After step 1:
+Peer 0: [A*, ?, ?, D*]   Peer 1: [A*, B*, ?, ?]
+Peer 2: [?, B*, C*, ?]   Peer 3: [?, ?, C*, D*]
+
+...continue for N-1 steps...
+
+Final Result (all peers identical):
+Peer 0: [A*, B*, C*, D*]
+Peer 1: [A*, B*, C*, D*]
+Peer 2: [A*, B*, C*, D*]
+Peer 3: [A*, B*, C*, D*]
+        </div>
+
+        <h2>The Math</h2>
+
+        <div class="brain-power">
+            <h3>Bandwidth Analysis</h3>
+            <p>For N peers, each with data of size S:</p>
+            <ul>
+                <li><strong>Reduce-Scatter:</strong> (N-1) steps, each sending S/N data = (N-1)×S/N</li>
+                <li><strong>All-Gather:</strong> (N-1) steps, each sending S/N data = (N-1)×S/N</li>
+                <li><strong>Total per peer:</strong> 2×(N-1)×S/N ≈ 2S for large N</li>
+            </ul>
+            <p>Each peer sends ~2× its data, regardless of world size. That's optimal!</p>
+        </div>
+
+        <div class="exercise">
+            <h3>✏️ Calculate It!</h3>
+            <p>You have 8 peers, each with a 1GB tensor. How much data does each peer SEND in total?</p>
+            <p>Hint: Use the formula 2×(N-1)×S/N</p>
+            
+            <div class="answer-reveal">
+                <strong>Answer:</strong> 2 × (8-1) × 1GB / 8 = 2 × 7 × 0.125GB = 1.75GB<br>
+                Each peer sends 1.75GB to complete the all-reduce!
+            </div>
+        </div>
+
+        <h2>PCCL's Implementation</h2>
+
+        <pre><code>// Simplified ring all-reduce pseudocode
+fn all_reduce(buffer: &mut [f32], world_size: usize, rank: usize) {
+    let chunk_size = buffer.len() / world_size;
+    let backup = buffer.clone();  // For fault tolerance!
+    
+    // Phase 1: Reduce-Scatter
+    for step in 0..(world_size - 1) {
+        let send_chunk = (rank - step) % world_size;
+        let recv_chunk = (rank - step - 1) % world_size;
+        
+        // Send my chunk to next peer
+        send_to_next(&buffer[send_chunk * chunk_size..]);
+        
+        // Receive chunk from previous peer
+        let received = recv_from_prev();
+        
+        // Accumulate into my buffer
+        for i in 0..chunk_size {
+            buffer[recv_chunk * chunk_size + i] += received[i];
+        }
+        
+        // Check for abort signal (fault tolerance!)
+        if master.has_abort() {
+            buffer.copy_from_slice(&backup);
+            return Err(Aborted);
+        }
+    }
+    
+    // Phase 2: All-Gather (similar structure, no accumulation)
+    // ...
+}</code></pre>
+
+        <div class="watch-it">
+            <h3>⚠️ The Backup Buffer</h3>
+            <p>Notice we clone the buffer BEFORE starting? That's crucial for fault tolerance!</p>
+            <p>If any peer fails mid-operation, we restore the backup and retry. Without this, you'd have corrupted half-reduced data.</p>
+        </div>
+
+        <h2>Multiple Connections: The WAN Trick</h2>
+
+        <div class="trivia">
+            <p><strong>TCP's dirty secret:</strong> A single TCP connection rarely saturates a WAN link. The receive window doesn't scale well with high latency.</p>
+            <p><strong>PCCL's trick:</strong> Open MULTIPLE connections and run concurrent all-reduces!</p>
+        </div>
+
+        <div class="diagram">
+Single Connection:
+┌─────────────────────────────────────────┐
+│  Tensor 1  │  Tensor 2  │  Tensor 3     │
+│  ────────► │  ────────► │  ────────►    │
+│            │            │               │
+│  Sequential, limited by TCP window      │
+│  Bandwidth: ~3 Gbit/s                   │
+└─────────────────────────────────────────┘
+
+128 Concurrent Connections:
+┌─────────────────────────────────────────┐
+│  Conn 1: Tensor 1  ────────►            │
+│  Conn 2: Tensor 2  ────────►            │
+│  Conn 3: Tensor 3  ────────►            │
+│  ...                                    │
+│  Conn 128: Tensor 128 ────────►         │
+│                                         │
+│  Parallel! Bandwidth: ~45 Gbit/s        │
+└─────────────────────────────────────────┘
+        </div>
+
+        <h2>Bit-Wise Determinism</h2>
+
+        <div class="remember-this">
+            <h3>💡 Why Ring All-Reduce is Naturally Deterministic</h3>
+            <p>In the all-gather phase, each peer broadcasts its OWNED chunk. No computation, just copying.</p>
+            <p>Since everyone receives the SAME bytes, everyone ends up with IDENTICAL results!</p>
+        </div>
+
+        <div class="watch-it">
+            <h3>⚠️ Quantization Breaks This!</h3>
+            <p>If you quantize (compress) data for transmission:</p>
+            <pre><code>// Problem: D(Q(x)) ≠ x
+// Dequantized data isn't exactly the original!
+
+// WRONG: Use local high-precision data
+accumulate(my_chunk, received_chunk)  // my_chunk has extra precision!
+
+// RIGHT: Quantize your own data too
+accumulate(dequant(quant(my_chunk)), received_chunk)</code></pre>
+            <p>Otherwise you get "lingering precision" that other peers don't have!</p>
+        </div>
+
+        <h2>Code Magnet Exercise</h2>
+
+        <div class="code-magnet">
+            <h3>Arrange these to implement reduce-scatter step:</h3>
+            
+            <div style="display: flex; flex-wrap: wrap; gap: 10px; margin: 1rem 0;">
+                <code style="background: var(--bg-sidebar); padding: 0.5rem;">recv_chunk = recv_from_prev()</code>
+                <code style="background: var(--bg-sidebar); padding: 0.5rem;">send_to_next(my_chunk)</code>
+                <code style="background: var(--bg-sidebar); padding: 0.5rem;">buffer[idx] += recv_chunk[i]</code>
+                <code style="background: var(--bg-sidebar); padding: 0.5rem;">check_abort_signal()</code>
+            </div>
+            
+            <p>Correct order: ___ → ___ → ___ → ___</p>
+            
+            <div class="answer-reveal">
+                <strong>Answer:</strong> send_to_next → recv_from_prev → accumulate → check_abort<br>
+                (Send and recv can be concurrent for full-duplex!)
+            </div>
+        </div>
+
+        <div class="mnemonic">
+            <p class="mnemonic-text">"SCATTER then GATHER = Everyone gets the PLATTER"</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">Reduce-Scatter distributes work, All-Gather collects results!</p>
+        </div>
+
+        <h2>Chapter Summary</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>Ring All-Reduce:</strong> Two phases - reduce-scatter + all-gather</li>
+                <li><strong>Bandwidth Optimal:</strong> Each peer sends ~2× its data, regardless of N</li>
+                <li><strong>Fault Tolerant:</strong> Backup buffer allows clean abort and retry</li>
+                <li><strong>WAN Trick:</strong> Multiple concurrent connections = more bandwidth</li>
+                <li><strong>Deterministic:</strong> All-gather phase ensures identical results</li>
+                <li><strong>Quantization Warning:</strong> Must quantize your own data too!</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter3-state-machines.html" class="prev">← State Machines</a>
+            <a href="chapter5-fault-tolerance.html" class="next">Next: Fault Tolerance →</a>
+        </div>
+    </main>
+
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">All-Reduce</div>
+            <div class="glossary-def">Combine data from all peers, give result to all. The bread & butter of distributed ML.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Reduce-Scatter</div>
+            <div class="glossary-def">Phase 1: Combine data so each peer "owns" one fully-reduced chunk.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">All-Gather</div>
+            <div class="glossary-def">Phase 2: Share owned chunks so everyone has the complete result.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Chunk</div>
+            <div class="glossary-def">A piece of the tensor. Total size / world_size = chunk size.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Bandwidth Optimal</div>
+            <div class="glossary-def">Can't do better! Ring achieves theoretical minimum data transfer.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Parameter Server</div>
+            <div class="glossary-def">Alternative to ring: central node collects all data. Doesn't scale well.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Full-Duplex</div>
+            <div class="glossary-def">Send and receive simultaneously. Doubles effective bandwidth!</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Quantization</div>
+            <div class="glossary-def">Compressing data (e.g., float32 → int8) to reduce bandwidth. Lossy!</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Dequantization</div>
+            <div class="glossary-def">Decompressing quantized data back to original format.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Lingering Precision</div>
+            <div class="glossary-def">Extra precision in local data that peers don't have. Causes divergence!</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">TCP Window</div>
+            <div class="glossary-def">How much data TCP sends before waiting for ACK. Limits single-connection speed.</div>
+        </div>
+        
+        <div class="glossary-item">
+            <div class="glossary-term">Concurrent Connections</div>
+            <div class="glossary-def">Multiple TCP streams in parallel. PCCL's trick for WAN bandwidth.</div>
+        </div>
+    </aside>
+</body>
+</html>

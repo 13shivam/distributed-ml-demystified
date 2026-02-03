@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 5: Fault Tolerance - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html" class="active">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Chapter 5: Fault Tolerance</h1>
+        <p class="subtitle">What Happens When Things Go Wrong (And They Will)</p>
+
+        <div class="analogy-box">
+            <h3>🎭 The Improv Theater Analogy</h3>
+            <p>In improv comedy, when an actor forgets their line or trips, the show must go on. The other actors adapt, cover, and continue seamlessly.</p>
+            <p>PCCL is like a well-trained improv troupe - when a peer "forgets their line" (crashes), the others adapt and continue training!</p>
+        </div>
+
+        <h2>Why Fault Tolerance is Hard</h2>
+
+        <div class="remember-this">
+            <h3>💡 The Core Challenge</h3>
+            <p>Fault tolerance isn't a feature you bolt on. It's a property of the ENTIRE system. If error paths aren't unwound correctly:</p>
+            <ul>
+                <li>System could <strong>stall</strong> (deadlock)</li>
+                <li>System could enter <strong>inconsistent state</strong></li>
+                <li>Recovery could be <strong>slower than restart</strong></li>
+            </ul>
+        </div>
+
+        <div class="fireside-chat">
+            <div class="chat-message"><span class="chat-speaker">Previous PCCL Attempt:</span> "Let peers join and leave anytime! Maximum flexibility!"</div>
+            <div class="chat-message"><span class="chat-speaker">Reality:</span> "That creates infinite possible states. You can't handle all error paths."</div>
+            <div class="chat-message"><span class="chat-speaker">Previous PCCL:</span> "But users want flexibility—"</div>
+            <div class="chat-message"><span class="chat-speaker">Reality:</span> "Users want it to WORK. Restrict operations. Make states enumerable."</div>
+            <div class="chat-message"><span class="chat-speaker">Current PCCL:</span> "One operation at a time. Explicit state machine. Now I can handle every failure."</div>
+        </div>
+
+        <h2>Failure Scenario Matrix</h2>
+
+        <table>
+            <tr>
+                <th>When Failure Occurs</th>
+                <th>What Happens</th>
+                <th>Recovery Action</th>
+            </tr>
+            <tr>
+                <td>Before collective starts</td>
+                <td>Peer detected as dead during vote</td>
+                <td>Remove peer, continue with smaller world_size</td>
+            </tr>
+            <tr>
+                <td>During reduce-scatter</td>
+                <td>Send/recv times out or errors</td>
+                <td>Abort signal → restore backup → retry without failed peer</td>
+            </tr>
+            <tr>
+                <td>During all-gather</td>
+                <td>Send/recv times out or errors</td>
+                <td>Abort signal → restore backup → retry without failed peer</td>
+            </tr>
+            <tr>
+                <td>During vote-complete</td>
+                <td>Peer doesn't acknowledge</td>
+                <td>Timeout → remove peer → operation still succeeds for others</td>
+            </tr>
+            <tr>
+                <td>During shared state sync</td>
+                <td>P2P transfer fails</td>
+                <td>Abort → retry sync from different peer</td>
+            </tr>
+            <tr>
+                <td>Master dies</td>
+                <td>All coordination stops</td>
+                <td>Restart master → peers reconnect → resume from last state</td>
+            </tr>
+        </table>
+
+        <h2>The Abort Signal Mechanism</h2>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    ABORT SIGNAL PROPAGATION                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Scenario: Peer B dies during all-reduce
+
+  Peer A              Master              Peer C
+    │                    │                   │
+    │ ══════════ ALL-REDUCE IN PROGRESS ════│
+    │                    │                   │
+    │──── chunk ────►[Peer B DEAD]           │
+    │                    │                   │
+    │   (timeout)        │                   │
+    │                    │                   │
+    │── report_failure ─►│                   │
+    │                    │                   │
+    │                    │◄── report_failure─│ (Peer C also noticed)
+    │                    │                   │
+    │◄───── ABORT ───────│────── ABORT ─────►│
+    │                    │                   │
+    │  restore_backup    │    restore_backup │
+    │                    │                   │
+    │                    │── remove Peer B ──│
+    │                    │                   │
+    │◄── topology_update─│── topology_update►│
+    │                    │                   │
+    │ ══════════ RETRY (world_size=2) ══════│
+    │                    │                   │
+    │◄──────────────────►│◄─────────────────►│
+    │                    │                   │
+    │              SUCCESS!                  │
+    ▼                    ▼                   ▼
+        </div>
+
+        <h2>Buffer Backup & Restore</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ Critical for Correctness</h3>
+            <p>Without buffer backup, a failed collective leaves you with CORRUPTED data - partially reduced, unusable. You'd have to reload from checkpoint!</p>
+        </div>
+
+        <pre><code>fn all_reduce(buffer: &mut [f32]) -> Result<()> {
+    // CRITICAL: Backup before ANY modification
+    let backup = buffer.to_vec();
+    
+    // Attempt the collective
+    match perform_ring_reduce(buffer) {
+        Ok(()) => {
+            // Success! Backup no longer needed
+            Ok(())
+        }
+        Err(Aborted) => {
+            // Failure! Restore original data
+            buffer.copy_from_slice(&backup);
+            Err(Aborted)
+        }
+    }
+}</code></pre>
+
+        <div class="remember-this">
+            <h3>💡 Error Path ≈ Success Path</h3>
+            <p>In PCCL, recovering from an error is almost as fast as succeeding. No expensive rollback mechanisms, no checkpoint reloads. Just:</p>
+            <ol>
+                <li>Restore buffer from backup (memcpy)</li>
+                <li>Update topology (remove failed peer)</li>
+                <li>Retry operation</li>
+            </ol>
+        </div>
+
+        <h2>The No-I/O Abort Check</h2>
+
+        <p>Checking for abort signals must NOT add I/O overhead to the hot path:</p>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    ABORT CHECK ARCHITECTURE                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────┐
+│   Master Socket     │ ◄── Separate TCP connection
+│   (background)      │
+└──────────┬──────────┘
+           │
+           │ Abort message arrives
+           ▼
+┌─────────────────────┐
+│  Receive Thread     │ ◄── Dedicated thread, always listening
+│  (async)            │
+└──────────┬──────────┘
+           │
+           │ Push to queue (lock-free)
+           ▼
+┌─────────────────────┐
+│  Lock-Free Queue    │ ◄── No locks, no syscalls to check
+└──────────┬──────────┘
+           │
+           │ Collective loop checks: queue.pop()
+           ▼
+┌─────────────────────┐
+│  Collective Loop    │
+│                     │
+│  while not done:    │
+│    send_async()     │
+│    recv_async()     │
+│    if queue.pop():  │ ◄── Nearly FREE! Just memory read
+│      return ABORT   │
+│    accumulate()     │
+└─────────────────────┘
+        </div>
+
+        <h2>Stress Testing</h2>
+
+        <div class="trivia">
+            <p><strong>PCCL passes 8-hour stress tests</strong> on Linux, macOS, and Windows with:</p>
+            <ul>
+                <li>Peers spawned and killed every <strong>500-1000 milliseconds</strong></li>
+                <li>High-frequency training loop (~100ms per iteration)</li>
+                <li>Multiple concurrent collective operations</li>
+                <li>Random peer churn throughout</li>
+            </ul>
+            <p>As long as shared state advances correctly despite chaos, the test passes!</p>
+        </div>
+
+        <h2>World Size Threshold</h2>
+
+        <div class="no-dumb-questions">
+            <p><strong>Q: What if ALL peers die?</strong></p>
+            <p>A: PCCL supports a minimum world_size threshold. If peers drop below this, training pauses and waits for new arrivals.</p>
+            
+            <p><strong>Q: What about the model weights?</strong></p>
+            <p>A: Weights are on the PEERS, not the master. Even if all peers die, when new peers join, they must provide the correct shared state hash (from checkpoint) to resume.</p>
+        </div>
+
+        <div class="diagram">
+World Size Behavior:
+─────────────────────────────────────────────────────────────────────────
+
+world_size = 10     Normal operation
+     │
+     │ (3 peers die)
+     ▼
+world_size = 7      Still above threshold, continue
+     │
+     │ (4 more peers die)
+     ▼
+world_size = 3      Below threshold (e.g., min=5)
+     │
+     │              PAUSE - wait for new peers
+     │
+     │ (3 new peers join)
+     ▼
+world_size = 6      Above threshold, resume!
+        </div>
+
+        <h2>What PCCL Does NOT Handle</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ Limitations</h3>
+            <ul>
+                <li><strong>Byzantine failures:</strong> PCCL assumes peers are honest (crash-stop model)</li>
+                <li><strong>Network partitions:</strong> If master is unreachable, peers cannot coordinate</li>
+                <li><strong>Data corruption:</strong> PCCL detects via hash, but doesn't correct (triggers resync)</li>
+                <li><strong>Master HA:</strong> Single master - if it dies, coordination stops until restart</li>
+            </ul>
+        </div>
+
+        <h2>Chapter Summary</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>Restrict to succeed:</strong> Limited operations make fault tolerance tractable</li>
+                <li><strong>Failure matrix:</strong> Every scenario has a defined recovery path</li>
+                <li><strong>Abort propagation:</strong> Master broadcasts abort, peers restore backups</li>
+                <li><strong>Buffer backup:</strong> Clone before modify, restore on failure</li>
+                <li><strong>No-I/O abort check:</strong> Lock-free queue, separate TCP stream</li>
+                <li><strong>Error ≈ success:</strong> Recovery is nearly as fast as normal operation</li>
+                <li><strong>Stress tested:</strong> 8 hours of chaos, 500ms peer churn</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter4-ring-allreduce.html" class="prev">← Ring All-Reduce</a>
+            <a href="chapter6-diloco.html" class="next">Next: DiLoCo Family →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">Fault Tolerance</div>
+            <div class="glossary-def">System keeps working even when parts fail. The holy grail of distributed systems.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Crash-Stop Model</div>
+            <div class="glossary-def">Failure model where nodes either work correctly or stop completely. No malicious behavior.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Byzantine Failure</div>
+            <div class="glossary-def">Nodes can behave arbitrarily (including maliciously). Much harder to handle than crash-stop.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Abort Signal</div>
+            <div class="glossary-def">Message from master telling peers to stop current operation immediately.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Buffer Backup</div>
+            <div class="glossary-def">Clone of data before operation. Used to restore state on failure.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Lock-Free Queue</div>
+            <div class="glossary-def">Queue using atomic operations instead of locks. No blocking, predictable latency.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Graceful Degradation</div>
+            <div class="glossary-def">System continues with reduced capacity rather than crashing entirely.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">World Size Threshold</div>
+            <div class="glossary-def">Minimum number of peers required to continue training.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Network Partition</div>
+            <div class="glossary-def">When network splits into groups that can't communicate. The "P" in CAP theorem.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Deadlock</div>
+            <div class="glossary-def">System stuck waiting forever. Everyone waiting for everyone else.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Error Path</div>
+            <div class="glossary-def">Code executed when something fails. Must be as robust as success path!</div>
+        </div>
+    </aside>
+</body>
+</html>

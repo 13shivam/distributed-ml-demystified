@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 3: State Machines - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html" class="active">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Chapter 3: State Machines</h1>
+        <p class="subtitle">The Finite States That Make Fault Tolerance Possible</p>
+
+        <div class="analogy-box">
+            <h3>🚦 The Traffic Light Analogy</h3>
+            <p>A traffic light has exactly 3 states: RED, YELLOW, GREEN. It can only transition in specific ways (GREEN→YELLOW→RED→GREEN).</p>
+            <p>This predictability is what makes intersections safe! You KNOW what comes next.</p>
+            <p>PCCL's state machine is the same idea - by limiting possible states and transitions, we can handle EVERY failure scenario.</p>
+        </div>
+
+        <h2>Why State Machines Matter</h2>
+
+        <div class="remember-this">
+            <h3>💡 The Key Insight</h3>
+            <p>Previous PCCL attempts failed because they allowed too many states:</p>
+            <ul>
+                <li>"Join anytime" = infinite possible states</li>
+                <li>Infinite states = can't enumerate error paths</li>
+                <li>Can't enumerate = can't handle all failures</li>
+            </ul>
+            <p><strong>Solution:</strong> Restrict to finite state machine → every error path is testable!</p>
+        </div>
+
+        <h2>The Three Levels of State</h2>
+
+        <p>PCCL tracks state at three levels:</p>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    THREE LEVELS OF STATE                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Level 1: CONNECTION PHASE (per peer)
+─────────────────────────────────────
+"Am I part of the group yet?"
+
+    ┌────────────┐                ┌────────────┐
+    │ REGISTERED │ ──── vote ───► │  ACCEPTED  │
+    │            │    passes      │            │
+    └────────────┘                └────────────┘
+    
+    • REGISTERED: Connected, but can't participate in collectives
+    • ACCEPTED: Full member, can participate in everything
+
+
+Level 2: CONNECTION STATE (per peer)
+─────────────────────────────────────
+"What am I doing right now?"
+
+    ┌──────┐     ┌───────────────────┐     ┌─────────────────────┐
+    │ IDLE │◄───►│ VOTE_ACCEPT_PEERS │◄───►│ COLLECTIVE_RUNNING  │
+    └──────┘     └───────────────────┘     └─────────────────────┘
+        ▲                                           ▲
+        │         ┌─────────────────┐               │
+        └────────►│ SYNCING_STATE   │◄──────────────┘
+                  └─────────────────┘
+
+
+Level 3: COLLECTIVE STATE (per operation tag)
+─────────────────────────────────────────────
+"Where is this specific operation?"
+
+    ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
+    │ VOTE_INITIATE │────►│  PERFORMING   │────►│ VOTE_COMPLETE │
+    └───────────────┘     └───────────────┘     └───────────────┘
+        </div>
+
+        <h2>Level 1: Connection Phase</h2>
+
+        <table>
+            <tr>
+                <th>Phase</th>
+                <th>Description</th>
+                <th>Can Do</th>
+            </tr>
+            <tr>
+                <td><code>REGISTERED</code></td>
+                <td>Connected to master, waiting for acceptance</td>
+                <td>Wait, receive topology updates</td>
+            </tr>
+            <tr>
+                <td><code>ACCEPTED</code></td>
+                <td>Voted in by existing peers</td>
+                <td>Everything: collectives, sync, P2P</td>
+            </tr>
+        </table>
+
+        <div class="diagram">
+Connection Phase Transition:
+─────────────────────────────────────────────────────────────────────────
+
+  New Peer                    Master                  Existing Peers
+     │                          │                          │
+     │─── connect() ───────────►│                          │
+     │                          │                          │
+     │◄── phase=REGISTERED ─────│                          │
+     │                          │                          │
+     │                          │◄── "accept new peer?" ───│
+     │                          │                          │
+     │                          │─── vote request ────────►│
+     │                          │                          │
+     │                          │◄── all vote YES ─────────│
+     │                          │                          │
+     │◄── phase=ACCEPTED ───────│                          │
+     │                          │                          │
+     │◄─────────────── establish P2P connections ─────────►│
+     │                          │                          │
+     ▼                          ▼                          ▼
+        </div>
+
+        <h2>Level 2: Connection State</h2>
+
+        <table>
+            <tr>
+                <th>State</th>
+                <th>Description</th>
+                <th>Transitions To</th>
+            </tr>
+            <tr>
+                <td><code>IDLE</code></td>
+                <td>Ready for any operation</td>
+                <td>Any other state</td>
+            </tr>
+            <tr>
+                <td><code>VOTE_ACCEPT_NEW_PEERS</code></td>
+                <td>Voting on whether to accept registered peers</td>
+                <td>IDLE (after vote)</td>
+            </tr>
+            <tr>
+                <td><code>SYNCING_SHARED_STATE</code></td>
+                <td>Synchronizing model weights/optimizer state</td>
+                <td>IDLE (after sync)</td>
+            </tr>
+            <tr>
+                <td><code>COLLECTIVE_COMMUNICATIONS_RUNNING</code></td>
+                <td>Executing a collective operation</td>
+                <td>IDLE (after complete)</td>
+            </tr>
+        </table>
+
+        <h2>Level 3: Collective State</h2>
+
+        <p>Each collective operation (identified by a tag) has its own state:</p>
+
+        <table>
+            <tr>
+                <th>State</th>
+                <th>Description</th>
+                <th>Next State</th>
+            </tr>
+            <tr>
+                <td><code>VOTE_INITIATE</code></td>
+                <td>Peers voting to start the operation</td>
+                <td>PERFORMING (if all agree)</td>
+            </tr>
+            <tr>
+                <td><code>PERFORMING</code></td>
+                <td>Actually executing (reduce-scatter, all-gather)</td>
+                <td>VOTE_COMPLETE (when done)</td>
+            </tr>
+            <tr>
+                <td><code>VOTE_COMPLETE</code></td>
+                <td>Peers confirming they finished</td>
+                <td>(end of operation)</td>
+            </tr>
+        </table>
+
+        <h2>The Golden Rule</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ ONE Operation At A Time!</h3>
+            <p>Within a single peer group, PCCL enforces:</p>
+            <ul>
+                <li>Only ONE major operation active at any moment</li>
+                <li>Cannot accept peers WHILE running collective</li>
+                <li>Cannot sync state WHILE accepting peers</li>
+                <li>Cannot run collective WHILE syncing state</li>
+            </ul>
+            <p><strong>Why?</strong> This restriction makes the state space finite and error paths enumerable!</p>
+        </div>
+
+        <div class="diagram">
+The One-Operation Rule:
+─────────────────────────────────────────────────────────────────────────
+
+ALLOWED:
+    IDLE → VOTE_ACCEPT → IDLE → COLLECTIVE → IDLE → SYNC → IDLE
+    (sequential, one at a time)
+
+NOT ALLOWED:
+    IDLE → VOTE_ACCEPT ─┬─► COLLECTIVE  ← CONFLICT!
+                        └─► SYNC        ← CONFLICT!
+    (parallel operations)
+        </div>
+
+        <h2>Micro-Consensus</h2>
+
+        <div class="remember-this">
+            <h3>💡 Every Transition Needs Agreement</h3>
+            <p>Before ANY state transition, ALL peers must agree. Like a jury - unanimous verdict required!</p>
+        </div>
+
+        <div class="diagram">
+Micro-Consensus Flow:
+─────────────────────────────────────────────────────────────────────────
+
+Master: "Ready to transition to COLLECTIVE_RUNNING?"
+   │
+   ├──► Peer A: "Ready!" ──┐
+   ├──► Peer B: "Ready!" ──┼──► Master: "All agreed!"
+   └──► Peer C: "Ready!" ──┘         │
+                                     ▼
+                              Broadcast: "GO!"
+                                     │
+   ┌─────────────────────────────────┼─────────────────────────────────┐
+   │                                 │                                 │
+   ▼                                 ▼                                 ▼
+Peer A                            Peer B                            Peer C
+transitions                       transitions                       transitions
+simultaneously                    simultaneously                    simultaneously
+        </div>
+
+        <h2>Complete State Transition Diagram</h2>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    COMPLETE STATE MACHINE                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                              ┌─────────────┐
+                              │  REGISTERED │
+                              └──────┬──────┘
+                                     │ vote passes
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           ACCEPTED PHASE                                │
+│                                                                         │
+│    ┌──────────────────────────────────────────────────────────────┐    │
+│    │                          IDLE                                 │    │
+│    └──────────────────────────┬───────────────────────────────────┘    │
+│                               │                                         │
+│         ┌─────────────────────┼─────────────────────┐                  │
+│         │                     │                     │                  │
+│         ▼                     ▼                     ▼                  │
+│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐            │
+│  │ VOTE_ACCEPT │      │ SYNC_STATE  │      │ COLLECTIVE  │            │
+│  │ _NEW_PEERS  │      │             │      │ _RUNNING    │            │
+│  └──────┬──────┘      └──────┬──────┘      └──────┬──────┘            │
+│         │                    │                    │                    │
+│         │                    │                    │                    │
+│         └────────────────────┴────────────────────┘                    │
+│                              │                                         │
+│                              ▼                                         │
+│                         back to IDLE                                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+        </div>
+
+        <h2>Exercise: Trace the Path</h2>
+
+        <div class="exercise">
+            <h3>✏️ Scenario</h3>
+            <p>A new peer wants to join and participate in an all-reduce. Trace the states:</p>
+            <ol>
+                <li>New peer connects → Phase: ___</li>
+                <li>Existing peers vote → Phase: ___</li>
+                <li>Peer is accepted → Phase: ___, State: ___</li>
+                <li>All-reduce starts → State: ___, CollectiveState: ___</li>
+                <li>All-reduce completes → State: ___</li>
+            </ol>
+            
+            <div class="answer-reveal">
+                <strong>Answers:</strong><br>
+                1. REGISTERED<br>
+                2. REGISTERED (still waiting)<br>
+                3. ACCEPTED, IDLE<br>
+                4. COLLECTIVE_RUNNING, VOTE_INITIATE → PERFORMING → VOTE_COMPLETE<br>
+                5. IDLE
+            </div>
+        </div>
+
+        <div class="mnemonic">
+            <p class="mnemonic-text">"RAI-SCV" = Registered → Accepted → Idle → Sync/Collective/Vote</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">The journey of a peer through PCCL states!</p>
+        </div>
+
+        <h2>Chapter Summary</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>Three levels:</strong> ConnectionPhase, ConnectionState, CollectiveState</li>
+                <li><strong>Finite states:</strong> Makes error paths enumerable and testable</li>
+                <li><strong>One operation rule:</strong> Only one major operation at a time</li>
+                <li><strong>Micro-consensus:</strong> All peers must agree before any transition</li>
+                <li><strong>Predictability:</strong> Like traffic lights - you always know what's next</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter2-architecture.html" class="prev">← Architecture</a>
+            <a href="chapter4-ring-allreduce.html" class="next">Next: Ring All-Reduce →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">State Machine</div>
+            <div class="glossary-def">System with finite states and defined transitions. Predictable, testable behavior.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">ConnectionPhase</div>
+            <div class="glossary-def">Level 1 state: REGISTERED or ACCEPTED. "Am I in the group?"</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">ConnectionState</div>
+            <div class="glossary-def">Level 2 state: IDLE, VOTING, SYNCING, or COLLECTIVE. "What am I doing?"</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">CollectiveState</div>
+            <div class="glossary-def">Level 3 state: Per-operation state. VOTE_INITIATE, PERFORMING, VOTE_COMPLETE.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Micro-Consensus</div>
+            <div class="glossary-def">All peers must agree before any state change. Unanimous vote required.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Transition</div>
+            <div class="glossary-def">Moving from one state to another. Requires consensus in PCCL.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Enumerable</div>
+            <div class="glossary-def">Can be listed/counted. Finite states = enumerable error paths = testable.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Tag</div>
+            <div class="glossary-def">Identifier for a collective operation. Allows tracking multiple operations.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Major Operation</div>
+            <div class="glossary-def">Accept peers, sync state, or run collective. Only one at a time!</div>
+        </div>
+    </aside>
+</body>
+</html>

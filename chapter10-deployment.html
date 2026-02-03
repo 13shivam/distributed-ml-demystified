@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 10: Deployment - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html" class="active">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Chapter 10: Deployment</h1>
+        <p class="subtitle">Taking PCCL from Lab to Production</p>
+
+        <div class="analogy-box">
+            <h3>🚀 The Restaurant Analogy</h3>
+            <p>A recipe that works in your kitchen might fail in a restaurant. You need: consistent ingredients, trained staff, backup plans, health inspections.</p>
+            <p>Deploying PCCL is similar: what works on your laptop needs hardening for production!</p>
+        </div>
+
+        <h2>Deployment Checklist</h2>
+
+        <div class="remember-this">
+            <h3>💡 Before You Deploy</h3>
+            <ul>
+                <li>☐ Network connectivity verified between all peers</li>
+                <li>☐ Firewall rules configured (ports open)</li>
+                <li>☐ Master node has stable IP/DNS</li>
+                <li>☐ Monitoring and alerting set up</li>
+                <li>☐ Checkpoint storage configured</li>
+                <li>☐ Rollback plan documented</li>
+            </ul>
+        </div>
+
+        <h2>Network Requirements</h2>
+
+        <table>
+            <tr>
+                <th>Requirement</th>
+                <th>Minimum</th>
+                <th>Recommended</th>
+            </tr>
+            <tr>
+                <td>Bandwidth</td>
+                <td>100 Mbps</td>
+                <td>1 Gbps+</td>
+            </tr>
+            <tr>
+                <td>Latency (RTT)</td>
+                <td>&lt;500ms</td>
+                <td>&lt;100ms</td>
+            </tr>
+            <tr>
+                <td>Packet Loss</td>
+                <td>&lt;5%</td>
+                <td>&lt;0.1%</td>
+            </tr>
+            <tr>
+                <td>Jitter</td>
+                <td>&lt;50ms</td>
+                <td>&lt;10ms</td>
+            </tr>
+        </table>
+
+        <h2>Port Configuration</h2>
+
+        <div class="code-block">
+<pre><code># Required ports (default)
+Master coordination:  TCP 7117
+P2P data transfer:    TCP 7118-7150 (range for multiple peers)
+Heartbeat:            UDP 7117
+
+# Firewall rules (iptables example)
+iptables -A INPUT -p tcp --dport 7117:7150 -j ACCEPT
+iptables -A INPUT -p udp --dport 7117 -j ACCEPT
+
+# Cloud security groups (AWS example)
+aws ec2 authorize-security-group-ingress \
+    --group-id sg-xxx \
+    --protocol tcp \
+    --port 7117-7150 \
+    --cidr 0.0.0.0/0</code></pre>
+        </div>
+
+        <h2>Deployment Architectures</h2>
+
+        <h3>Option 1: Single Master (Simple)</h3>
+        <div class="diagram">
+Single Master Deployment
+─────────────────────────────────────────────────────────────────────────
+
+                    ┌─────────────┐
+                    │   MASTER    │
+                    │  (stable)   │
+                    └──────┬──────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         │                 │                 │
+         ▼                 ▼                 ▼
+    ┌─────────┐       ┌─────────┐       ┌─────────┐
+    │ Worker1 │◄─────►│ Worker2 │◄─────►│ Worker3 │
+    └─────────┘       └─────────┘       └─────────┘
+         P2P mesh for data transfer
+
+Pros: Simple, easy to debug
+Cons: Master is single point of failure
+        </div>
+
+        <h3>Option 2: Master with Failover</h3>
+        <div class="diagram">
+Master Failover Deployment
+─────────────────────────────────────────────────────────────────────────
+
+    ┌─────────────┐         ┌─────────────┐
+    │   MASTER    │◄───────►│   STANDBY   │
+    │  (active)   │  sync   │  (passive)  │
+    └──────┬──────┘         └──────┬──────┘
+           │                       │
+           └───────────┬───────────┘
+                       │ VIP/DNS failover
+                       ▼
+         ┌─────────────────────────────────┐
+         │           Workers               │
+         └─────────────────────────────────┘
+
+Pros: High availability
+Cons: More complex, needs shared state
+        </div>
+
+        <h3>Option 3: Kubernetes Deployment</h3>
+        <div class="code-block">
+<pre><code># pccl-master.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pccl-master
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pccl-master
+  template:
+    spec:
+      containers:
+      - name: master
+        image: pccl/master:latest
+        ports:
+        - containerPort: 7117
+        env:
+        - name: PCCL_ROLE
+          value: "master"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pccl-master
+spec:
+  selector:
+    app: pccl-master
+  ports:
+  - port: 7117
+    targetPort: 7117
+  type: LoadBalancer</code></pre>
+        </div>
+
+        <h2>Configuration Best Practices</h2>
+
+        <div class="code-block">
+<pre><code># pccl_config.yaml
+network:
+  master_host: "master.example.com"
+  master_port: 7117
+  heartbeat_interval_ms: 100
+  heartbeat_timeout_ms: 500
+
+fault_tolerance:
+  enable_buffer_backup: true
+  checkpoint_interval_steps: 100
+  max_recovery_attempts: 3
+
+performance:
+  ring_chunk_size: 4194304  # 4MB chunks
+  num_io_threads: 4
+  enable_compression: false  # disable for LAN
+
+logging:
+  level: "INFO"
+  file: "/var/log/pccl/worker.log"
+  max_size_mb: 100</code></pre>
+        </div>
+
+        <h2>Monitoring Setup</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ Key Metrics to Monitor</h3>
+            <ul>
+                <li><strong>peer_count:</strong> Number of active peers (alert if drops)</li>
+                <li><strong>collective_latency_p99:</strong> Operation latency (alert if spikes)</li>
+                <li><strong>recovery_count:</strong> Number of recoveries (alert if frequent)</li>
+                <li><strong>throughput_gbps:</strong> Data transfer rate</li>
+                <li><strong>buffer_backup_size:</strong> Memory used for fault tolerance</li>
+            </ul>
+        </div>
+
+        <div class="code-block">
+<pre><code># Prometheus metrics endpoint
+# PCCL exposes metrics at :9090/metrics
+
+# prometheus.yml
+scrape_configs:
+  - job_name: 'pccl'
+    static_configs:
+      - targets: ['worker1:9090', 'worker2:9090', 'worker3:9090']
+
+# Grafana dashboard query examples
+# Peer count over time
+pccl_peer_count
+
+# P99 latency
+histogram_quantile(0.99, pccl_collective_latency_bucket)
+
+# Recovery rate
+rate(pccl_recovery_total[5m])</code></pre>
+        </div>
+
+        <h2>Troubleshooting Guide</h2>
+
+        <table>
+            <tr>
+                <th>Symptom</th>
+                <th>Likely Cause</th>
+                <th>Solution</th>
+            </tr>
+            <tr>
+                <td>Peers can't connect</td>
+                <td>Firewall blocking</td>
+                <td>Check ports 7117-7150</td>
+            </tr>
+            <tr>
+                <td>Frequent recoveries</td>
+                <td>Network instability</td>
+                <td>Increase heartbeat timeout</td>
+            </tr>
+            <tr>
+                <td>Low throughput</td>
+                <td>Small chunk size</td>
+                <td>Increase ring_chunk_size</td>
+            </tr>
+            <tr>
+                <td>High latency</td>
+                <td>Too many peers</td>
+                <td>Use hierarchical topology</td>
+            </tr>
+            <tr>
+                <td>OOM errors</td>
+                <td>Buffer backup too large</td>
+                <td>Reduce model size or disable backup</td>
+            </tr>
+            <tr>
+                <td>Master unreachable</td>
+                <td>DNS/IP changed</td>
+                <td>Use stable DNS or static IP</td>
+            </tr>
+        </table>
+
+        <h2>Security Considerations</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ Production Security</h3>
+            <ul>
+                <li><strong>TLS:</strong> Enable encryption for all connections</li>
+                <li><strong>Authentication:</strong> Use shared secrets or certificates</li>
+                <li><strong>Network isolation:</strong> Use VPN or private network</li>
+                <li><strong>Access control:</strong> Limit who can join the cluster</li>
+            </ul>
+        </div>
+
+        <div class="code-block">
+<pre><code># Enable TLS
+network:
+  tls:
+    enabled: true
+    cert_file: "/etc/pccl/server.crt"
+    key_file: "/etc/pccl/server.key"
+    ca_file: "/etc/pccl/ca.crt"
+  
+  # Shared secret authentication
+  auth:
+    enabled: true
+    secret: "${PCCL_AUTH_SECRET}"  # from environment</code></pre>
+        </div>
+
+        <h2>Scaling Guidelines</h2>
+
+        <div class="diagram">
+Recommended Configurations by Scale
+─────────────────────────────────────────────────────────────────────────
+
+Peers       Topology            Master Resources    Notes
+─────       ────────            ────────────────    ─────
+2-8         Flat ring           1 CPU, 1GB RAM      Simple setup
+8-32        Flat ring           2 CPU, 4GB RAM      Monitor latency
+32-128      Hierarchical        4 CPU, 8GB RAM      Group by region
+128+        Multi-level         8 CPU, 16GB RAM     Expert tuning needed
+        </div>
+
+        <div class="exercise">
+            <h3>✏️ Deployment Planning</h3>
+            <p>You need to deploy PCCL for 16 workers across 2 data centers (8 each).</p>
+            <ol>
+                <li>What topology would you use?</li>
+                <li>Where should the master be located?</li>
+                <li>What's your failover strategy?</li>
+            </ol>
+            <div class="answer-reveal">
+                <strong>Suggested answers:</strong><br>
+                1. Hierarchical: local rings within each DC, then cross-DC sync<br>
+                2. In the DC with more stable network, or use DNS failover<br>
+                3. Standby master in other DC, shared state via database
+            </div>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter9-build-your-own.html" class="prev">← Build Your Own</a>
+            <a href="appendix-alternatives.html" class="next">Next: Alternatives →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">VIP</div>
+            <div class="glossary-def">Virtual IP. Floats between servers for failover.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Jitter</div>
+            <div class="glossary-def">Variation in latency. High jitter = unpredictable network.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Heartbeat</div>
+            <div class="glossary-def">Periodic "I'm alive" message. Detects failures.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Prometheus</div>
+            <div class="glossary-def">Popular monitoring system. Scrapes metrics endpoints.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Grafana</div>
+            <div class="glossary-def">Visualization tool. Creates dashboards from metrics.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">TLS</div>
+            <div class="glossary-def">Transport Layer Security. Encrypts network traffic.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">OOM</div>
+            <div class="glossary-def">Out Of Memory. Process killed due to memory exhaustion.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Hierarchical Topology</div>
+            <div class="glossary-def">Tree structure. Local groups sync internally, then sync across groups.</div>
+        </div>
+    </aside>
+</body>
+</html>

@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 7: Implementation - PCCL Guide</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="book-title">📚 PCCL Guide</div>
+        <ul>
+            <li><a href="index.html">Home</a></li>
+            <li><a href="chapter0-prerequisites.html">0. Prerequisites</a></li>
+            <li><a href="chapter1-introduction.html">1. The Problem</a></li>
+            <li><a href="chapter2-architecture.html">2. Architecture</a></li>
+            <li><a href="chapter3-state-machines.html">3. State Machines</a></li>
+            <li><a href="chapter4-ring-allreduce.html">4. Ring All-Reduce</a></li>
+            <li><a href="chapter5-fault-tolerance.html">5. Fault Tolerance</a></li>
+            <li><a href="chapter6-diloco.html">6. DiLoCo Family</a></li>
+            <li><a href="chapter7-implementation.html" class="active">7. Implementation</a></li>
+            <li><a href="chapter8-benchmarks.html">8. Benchmarks</a></li>
+            <li><a href="chapter9-build-your-own.html">9. Build Your Own</a></li>
+            <li><a href="chapter10-deployment.html">10. Deployment</a></li>
+            <li><a href="appendix-alternatives.html">A. Alternatives</a></li>
+        </ul>
+    </nav>
+    <main class="content">
+        <h1>Chapter 7: Implementation Deep Dive</h1>
+        <p class="subtitle">The Gory Details That Make PCCL Work</p>
+
+        <div class="remember-this">
+            <h3>💡 Why This Chapter Matters</h3>
+            <p>PCCL isn't just an algorithm - it's an engineering achievement. This chapter covers the hard-won lessons from making fault-tolerant collectives work across Linux, macOS, and Windows.</p>
+        </div>
+
+        <h2>1. Socket Implementation Behavior</h2>
+
+        <p>PCCL targets TCP/IP for public internet use. But socket APIs differ drastically between operating systems:</p>
+
+        <div class="watch-it">
+            <h3>⚠️ The Cross-Platform Nightmare</h3>
+            <p>What works on Linux may hang on Windows. What works on Windows may crash on macOS. PCCL learned this the hard way.</p>
+        </div>
+
+        <table>
+            <tr>
+                <th>Behavior</th>
+                <th>Linux</th>
+                <th>macOS (XNU)</th>
+                <th>Windows (WSA)</th>
+            </tr>
+            <tr>
+                <td>Error codes</td>
+                <td>POSIX errno</td>
+                <td>POSIX errno</td>
+                <td>WSAGetLastError() - different values!</td>
+            </tr>
+            <tr>
+                <td>recv() on close()</td>
+                <td>Returns 0 or error</td>
+                <td>May block indefinitely</td>
+                <td>Returns error</td>
+            </tr>
+            <tr>
+                <td>Half-close drain</td>
+                <td>Standard behavior</td>
+                <td>Standard behavior</td>
+                <td>Different timing!</td>
+            </tr>
+            <tr>
+                <td>Send buffer exhaustion</td>
+                <td>Blocks or EAGAIN</td>
+                <td>Buggy behavior observed</td>
+                <td>Blocks or WSAEWOULDBLOCK</td>
+            </tr>
+            <tr>
+                <td>shutdown() behavior</td>
+                <td>Predictable</td>
+                <td>Quirky with non-blocking</td>
+                <td>Predictable</td>
+            </tr>
+        </table>
+
+        <div class="trivia">
+            <p><strong>Real bug found:</strong> The PCCL team discovered what they believe is a bug in the XNU kernel (macOS) related to send buffer exhaustion handling!</p>
+        </div>
+
+        <h2>2. Threadpark: Low-Latency Wake-ups</h2>
+
+        <div class="no-dumb-questions">
+            <p><strong>Q: Why not just use std::condition_variable?</strong></p>
+            <p>A: Wake-up latency is too high! For full-duplex links, PCCL uses dedicated send/recv threads per connection. Standard C++ synchronization primitives add unacceptable delays.</p>
+        </div>
+
+        <p>PCCL implements a custom library called <strong>threadpark</strong> using OS-specific fast wake mechanisms:</p>
+
+        <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    THREADPARK: PLATFORM-SPECIFIC WAKE                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Linux:
+┌─────────────────────────────────────────┐
+│  #include <linux/futex.h>               │
+│  syscall(SYS_futex, &flag,              │
+│          FUTEX_WAIT, 0, nullptr);       │
+│                                         │
+│  // Wake: FUTEX_WAKE                    │
+└─────────────────────────────────────────┘
+
+macOS:
+┌─────────────────────────────────────────┐
+│  __ulock_wait(UL_COMPARE_AND_WAIT,      │
+│               &flag, 0, 0);             │
+│                                         │
+│  // Wake: __ulock_wake                  │
+└─────────────────────────────────────────┘
+
+Windows:
+┌─────────────────────────────────────────┐
+│  WaitOnAddress(&flag, &zero,            │
+│                sizeof(flag), INFINITE); │
+│                                         │
+│  // Wake: WakeByAddressSingle           │
+└─────────────────────────────────────────┘
+        </div>
+
+        <div class="remember-this">
+            <h3>💡 Futex = Fast Userspace Mutex</h3>
+            <p>These APIs allow threads to sleep and wake WITHOUT kernel transitions in the fast path. Only when actual waiting is needed does the kernel get involved.</p>
+        </div>
+
+        <h2>3. Zero-Copy Architecture</h2>
+
+        <p>PCCL implements <strong>zero-copy</strong> collective operations:</p>
+
+        <div class="bullet-points">
+            <ul>
+                <li>User-provided buffers (PyTorch tensor storage) are referenced directly by send()</li>
+                <li>No intermediate copies between user space and network stack</li>
+                <li>Custom caching allocator avoids malloc()/free() in hot path</li>
+                <li>Pre-touched pages avoid lazy initialization page faults</li>
+            </ul>
+        </div>
+
+        <div class="diagram">
+Traditional (with copies):
+┌──────────┐    copy    ┌──────────┐    copy    ┌──────────┐
+│  Tensor  │ ─────────► │  Buffer  │ ─────────► │  Socket  │
+└──────────┘            └──────────┘            └──────────┘
+
+PCCL Zero-Copy:
+┌──────────┐                        ┌──────────┐
+│  Tensor  │ ─────────────────────► │  Socket  │
+└──────────┘   direct reference     └──────────┘
+        </div>
+
+        <div class="watch-it">
+            <h3>⚠️ Zero-Malloc Policy</h3>
+            <p>The reduce code path has a strict zero-malloc policy. Dynamic allocation in the hot path causes:</p>
+            <ul>
+                <li>Unpredictable latency from allocator locks</li>
+                <li>Page faults from lazy memory initialization</li>
+                <li>Memory fragmentation over long runs</li>
+            </ul>
+            <p>PCCL uses a custom caching allocator to get malloc-like convenience without the costs.</p>
+        </div>
+
+        <h2>4. SimpleHash Algorithm</h2>
+
+        <p>PCCL needs to verify all peers have identical state. This requires hashing potentially gigabytes of tensor data FAST.</p>
+
+        <div class="remember-this">
+            <h3>💡 SimpleHash Design Goals</h3>
+            <ul>
+                <li><strong>Fast:</strong> Must not bottleneck training</li>
+                <li><strong>Parallelizable:</strong> Must run on GPU</li>
+                <li><strong>Deterministic:</strong> Same result on CPU and GPU</li>
+                <li><strong>Cross-architecture:</strong> Same result on GTX 980 Ti and B200</li>
+            </ul>
+        </div>
+
+        <h3>Algorithm Details</h3>
+
+        <div class="bullet-points">
+            <ul>
+                <li>Inspired by <strong>FNV-1a</strong> (Fowler-Noll-Vo) hash</li>
+                <li>Uses <strong>warp-tree reduce</strong> for GPU parallelism</li>
+                <li>Completely deterministic despite parallel execution</li>
+                <li>Also implemented on CPU using OpenMP (same hash output!)</li>
+            </ul>
+        </div>
+
+        <div class="diagram">
+SimpleHash on GPU:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  Thread 0   Thread 1   Thread 2   ...   Thread 31  (one warp)          │
+│     │          │          │                │                           │
+│     ▼          ▼          ▼                ▼                           │
+│  ┌─────┐    ┌─────┐    ┌─────┐          ┌─────┐                        │
+│  │hash0│    │hash1│    │hash2│    ...   │hash31│   Local hashes       │
+│  └──┬──┘    └──┬──┘    └──┬──┘          └──┬──┘                        │
+│     │          │          │                │                           │
+│     └────┬─────┴────┬─────┴───...───┬─────┘                            │
+│          │          │               │                                  │
+│          ▼          ▼               ▼                                  │
+│       Warp-tree reduce (deterministic order!)                          │
+│          │                                                             │
+│          ▼                                                             │
+│     Final hash                                                         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+        </div>
+
+        <div class="trivia">
+            <p><strong>Performance:</strong> SimpleHash achieves throughput comparable to NVIDIA Thrust's reduce kernels - nearly saturating memory bandwidth on an RTX 4090 (~1000 GB/s)!</p>
+        </div>
+
+        <h2>5. Quantization & Bit-Wise Determinism</h2>
+
+        <div class="watch-it">
+            <h3>⚠️ The Quantization Trap</h3>
+            <p>Ring all-reduce is naturally bit-deterministic. But quantization BREAKS this!</p>
+        </div>
+
+        <h3>The Problem</h3>
+
+        <p>For most quantization functions:</p>
+        <pre><code>D(Q(x)) ≠ x   // Dequantize(Quantize(x)) is NOT equal to x!</code></pre>
+
+        <p>Quantization is lossy. When you compress float32 to int8 and back, you lose precision.</p>
+
+        <h3>The "Lingering Precision" Bug</h3>
+
+        <div class="diagram">
+The Bug:
+─────────────────────────────────────────────────────────────────────────
+Peer A has local chunk with FULL precision: [1.23456789, ...]
+Peer A quantizes and sends: Q([1.23456789]) → [123]  (int8)
+Peer B receives and dequantizes: D([123]) → [1.23000000]
+
+But Peer A still has [1.23456789] locally!
+
+After reduce:
+  Peer A: accumulate([1.23456789], received) → has extra precision!
+  Peer B: accumulate([1.23000000], received) → normal precision
+
+Result: Peer A and Peer B have DIFFERENT values!
+        STATE DIVERGENCE! 💥
+        </div>
+
+        <h3>The Solution</h3>
+
+        <pre><code>// WRONG: Use local high-precision data
+accumulate(my_chunk, received_chunk);
+
+// RIGHT: Quantize your own data too!
+accumulate(dequant(quant(my_chunk)), received_chunk);</code></pre>
+
+        <div class="remember-this">
+            <h3>💡 Rule: Throw Away Your Extra Precision</h3>
+            <p>For bit-wise determinism with quantization, you must NOT use precision that other peers don't have. Quantize your own contribution before accumulating.</p>
+        </div>
+
+        <h2>6. NVIDIA PTX Determinism</h2>
+
+        <p>For deterministic state advancement, GPU operations must behave identically across hardware generations.</p>
+
+        <div class="no-dumb-questions">
+            <p><strong>Q: Does NVIDIA guarantee cross-architecture determinism?</strong></p>
+            <p>A: Not explicitly! PTX has "forward compatibility" but not necessarily identical behavior. PCCL had to verify this empirically.</p>
+        </div>
+
+        <h3>Verification Approach</h3>
+
+        <p>PCCL tested <code>__nv_expf</code> (exponential function) across architectures by:</p>
+        <ol>
+            <li>Running expf() on ALL 2³² possible float bit patterns</li>
+            <li>Hashing the output bits</li>
+            <li>Comparing hashes across GPU generations</li>
+        </ol>
+
+        <h3>Results</h3>
+
+        <table>
+            <tr>
+                <th>GPU</th>
+                <th>Architecture</th>
+                <th>Hash Match?</th>
+            </tr>
+            <tr><td>GTX 980 Ti</td><td>sm_52 (Maxwell)</td><td>✅ Yes</td></tr>
+            <tr><td>GTX 1060</td><td>sm_61 (Pascal)</td><td>✅ Yes</td></tr>
+            <tr><td>RTX 4090</td><td>sm_89 (Ada)</td><td>✅ Yes</td></tr>
+            <tr><td>GH200</td><td>sm_90 (Hopper)</td><td>✅ Yes</td></tr>
+            <tr><td>B200</td><td>sm_100 (Blackwell)</td><td>✅ Yes</td></tr>
+        </table>
+
+        <div class="trivia">
+            <p><strong>All architectures produced identical output!</strong> This gives confidence (though not a guarantee) that NVIDIA's libdevice intrinsics are cross-architecture deterministic.</p>
+        </div>
+
+        <h2>7. Interruptible Operations</h2>
+
+        <p>PCCL operations must be interruptible for fault tolerance. The challenge: checking for abort signals without adding I/O overhead.</p>
+
+        <div class="diagram">
+Abort Check During Collective:
+─────────────────────────────────────────────────────────────────────────
+                    ┌─────────────────┐
+                    │  Master Socket  │ (separate TCP stream)
+                    │  (push thread)  │
+                    └────────┬────────┘
+                             │
+                             │ Abort signal pushed asynchronously
+                             ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Collective Operation Loop:                                             │
+│                                                                         │
+│  while not done:                                                        │
+│      send_chunk_async()                                                 │
+│      recv_chunk_async()                                                 │
+│                                                                         │
+│      # Check abort - NO I/O! Just check queue                          │
+│      if master_socket.recv_queue.has_message():  ◄── Nearly free!      │
+│          return ABORTED                                                 │
+│                                                                         │
+│      accumulate()                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+        </div>
+
+        <div class="remember-this">
+            <h3>💡 The Trick: Separate TCP Stream</h3>
+            <p>The master connection is a SEPARATE TCP stream from P2P data connections. A background thread receives abort signals and pushes to a lock-free queue. The collective loop just checks the queue - no syscalls needed!</p>
+        </div>
+
+        <h2>Chapter Summary</h2>
+
+        <div class="bullet-points">
+            <ul>
+                <li><strong>Socket quirks:</strong> Behavior differs across OS - extensive testing required</li>
+                <li><strong>Threadpark:</strong> Custom low-latency wake using futex/__ulock/WaitOnAddress</li>
+                <li><strong>Zero-copy:</strong> Direct tensor-to-socket, custom allocator, zero-malloc policy</li>
+                <li><strong>SimpleHash:</strong> FNV-1a inspired, warp-tree reduce, GPU/CPU parity</li>
+                <li><strong>Quantization:</strong> D(Q(x))≠x causes "lingering precision" - must quantize own data</li>
+                <li><strong>PTX determinism:</strong> Empirically verified across 5 GPU generations</li>
+                <li><strong>Interruptible:</strong> Abort check via lock-free queue, no I/O overhead</li>
+            </ul>
+        </div>
+
+        <div class="navigation">
+            <a href="chapter6-diloco.html" class="prev">← DiLoCo Family</a>
+            <a href="chapter8-benchmarks.html" class="next">Next: Benchmarks →</a>
+        </div>
+    </main>
+    <aside class="glossary-sidebar">
+        <div class="glossary-title">📖 Jargon Buster</div>
+        <div class="glossary-item">
+            <div class="glossary-term">Futex</div>
+            <div class="glossary-def">Fast Userspace Mutex. Linux syscall for efficient thread synchronization without kernel transitions in fast path.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">__ulock_wait</div>
+            <div class="glossary-def">macOS equivalent of futex. Undocumented but used by Apple's own libraries.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">WaitOnAddress</div>
+            <div class="glossary-def">Windows equivalent of futex. Available since Windows 8.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Zero-Copy</div>
+            <div class="glossary-def">Data sent directly from user buffer to network without intermediate copies.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">FNV-1a</div>
+            <div class="glossary-def">Fowler-Noll-Vo hash. Fast non-cryptographic hash function from 1991.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Warp-Tree Reduce</div>
+            <div class="glossary-def">GPU reduction pattern using warp shuffle instructions. Deterministic order.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Quantization</div>
+            <div class="glossary-def">Compressing data (e.g., float32→int8) to reduce bandwidth. Lossy!</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Lingering Precision</div>
+            <div class="glossary-def">Extra precision in local data that peers don't have. Causes state divergence.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">PTX</div>
+            <div class="glossary-def">Parallel Thread Execution. NVIDIA's intermediate assembly language for GPUs.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">libdevice</div>
+            <div class="glossary-def">NVIDIA's math library as LLVM bitcode. Contains __nv_expf etc.</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">Lock-Free Queue</div>
+            <div class="glossary-def">Queue that doesn't use locks. Uses atomic operations instead. Fast!</div>
+        </div>
+        <div class="glossary-item">
+            <div class="glossary-term">WSA</div>
+            <div class="glossary-def">Windows Sockets API. Microsoft's socket implementation. Different from BSD.</div>
+        </div>
+    </aside>
+</body>
+</html>
